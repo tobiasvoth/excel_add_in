@@ -7,11 +7,11 @@
   xsi:type="TaskPaneApp">
 
   <Id>cd5c61d5-718f-42cb-b69a-7a723d9c98bc</Id>
-  <Version>1.0.0.0</Version>
+  <Version>1.0.0.1</Version>
   <ProviderName>Mein Name</ProviderName>
   <DefaultLocale>de-DE</DefaultLocale>
   <DisplayName DefaultValue="Schreibe Zwei"/>
-  <Description DefaultValue="Schreibt per Knopfdruck eine 2 in die aktive Zelle."/>
+  <Description DefaultValue="Öffnet eine Seitenleiste mit einem Button, der eine 2 in die aktive Zelle schreibt."/>
   <IconUrl DefaultValue="https://tobiasvoth.github.io/excel_add_in/assets/icon-32.png"/>
   <HighResolutionIconUrl DefaultValue="https://tobiasvoth.github.io/excel_add_in/assets/icon-80.png"/>
   <SupportUrl DefaultValue="https://tobiasvoth.github.io/excel_add_in/taskpane.html"/>
@@ -21,7 +21,6 @@
   </Hosts>
 
   <DefaultSettings>
-    <!-- Pflichtangabe für TaskPaneApp; die Seite wird hier nur als Platzhalter genutzt -->
     <SourceLocation DefaultValue="https://tobiasvoth.github.io/excel_add_in/taskpane.html"/>
   </DefaultSettings>
 
@@ -31,9 +30,6 @@
     <Hosts>
       <Host xsi:type="Workbook">
         <DesktopFormFactor>
-          <!-- Datei mit der Funktion, die der Button ausführt -->
-          <FunctionFile resid="Commands.Url"/>
-
           <ExtensionPoint xsi:type="PrimaryCommandSurface">
             <OfficeTab id="TabHome">
               <Group id="CommandsGroup">
@@ -44,19 +40,20 @@
                   <bt:Image size="80" resid="Icon.80x80"/>
                 </Icon>
 
-                <Control xsi:type="Button" id="WriteTwoButton">
-                  <Label resid="WriteTwoButton.Label"/>
+                <Control xsi:type="Button" id="TaskpaneButton">
+                  <Label resid="TaskpaneButton.Label"/>
                   <Supertip>
-                    <Title resid="WriteTwoButton.Label"/>
-                    <Description resid="WriteTwoButton.Tooltip"/>
+                    <Title resid="TaskpaneButton.Label"/>
+                    <Description resid="TaskpaneButton.Tooltip"/>
                   </Supertip>
                   <Icon>
                     <bt:Image size="16" resid="Icon.16x16"/>
                     <bt:Image size="32" resid="Icon.32x32"/>
                     <bt:Image size="80" resid="Icon.80x80"/>
                   </Icon>
-                  <Action xsi:type="ExecuteFunction">
-                    <FunctionName>writeTwo</FunctionName>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>ButtonTaskpane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url"/>
                   </Action>
                 </Control>
               </Group>
@@ -73,14 +70,14 @@
         <bt:Image id="Icon.80x80" DefaultValue="https://tobiasvoth.github.io/excel_add_in/assets/icon-80.png"/>
       </bt:Images>
       <bt:Urls>
-        <bt:Url id="Commands.Url" DefaultValue="https://tobiasvoth.github.io/excel_add_in/commands.html"/>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://tobiasvoth.github.io/excel_add_in/taskpane.html"/>
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="CommandsGroup.Label" DefaultValue="Schreibe Zwei"/>
-        <bt:String id="WriteTwoButton.Label" DefaultValue="2 eintragen"/>
+        <bt:String id="TaskpaneButton.Label" DefaultValue="Seitenleiste"/>
       </bt:ShortStrings>
       <bt:LongStrings>
-        <bt:String id="WriteTwoButton.Tooltip" DefaultValue="Schreibt eine 2 in die aktuell ausgewählte Zelle."/>
+        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Öffnet die Seitenleiste mit dem Button „2 eintragen“."/>
       </bt:LongStrings>
     </Resources>
   </VersionOverrides>
