@@ -1,16 +1,26 @@
-<!DOCTYPE html>
-<html lang="de">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Schreibe Zwei</title>
-  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-  <style>
-    body { font-family: "Segoe UI", sans-serif; margin: 16px; }
-  </style>
-</head>
-<body>
-  <h3>Schreibe Zwei</h3>
-  <p>Nutze den Button <b>„2 eintragen“</b> im Menüband (Start-Tab).</p>
-</body>
-</html>
+// Läuft in der Seitenleiste (Task Pane).
+Office.onReady((info) => {
+  if (info.host === Office.HostType.Excel) {
+    const button = document.getElementById("writeTwo");
+    button.disabled = false;
+    button.addEventListener("click", writeTwo);
+  }
+});
+
+async function writeTwo() {
+  const status = document.getElementById("status");
+  status.textContent = "";
+
+  try {
+    await Excel.run(async (context) => {
+      const cell = context.workbook.getActiveCell(); // aktuell ausgewählte Zelle
+      cell.load("address");
+      cell.values = [[2]];
+      await context.sync();
+      status.textContent = `Eine 2 wurde in ${cell.address} geschrieben.`;
+    });
+  } catch (error) {
+    status.textContent = `Fehler: ${error.message}`;
+    console.error(error);
+  }
+}
