@@ -1,26 +1,36 @@
-// Läuft in der Seitenleiste (Task Pane).
-Office.onReady((info) => {
-  if (info.host === Office.HostType.Excel) {
-    const button = document.getElementById("writeTwo");
-    button.disabled = false;
-    button.addEventListener("click", writeTwo);
-  }
-});
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Schreibe Zwei</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: "Segoe UI", sans-serif; margin: 16px; }
+    h3 { margin-top: 0; }
+    button {
+      width: 100%;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-family: inherit;
+      color: #fff;
+      background: #217346;
+      border: 0;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover { background: #1a5c38; }
+    button:disabled { opacity: 0.6; cursor: default; }
+    #status { margin-top: 12px; font-size: 13px; min-height: 1.4em; }
+  </style>
+</head>
+<body>
+  <h3>Schreibe Zwei</h3>
+  <p>Klicke in Excel eine Zelle an und dann auf den Button.</p>
+  <button id="writeTwo" disabled>2 eintragen</button>
+  <p id="status" role="status"></p>
 
-async function writeTwo() {
-  const status = document.getElementById("status");
-  status.textContent = "";
-
-  try {
-    await Excel.run(async (context) => {
-      const cell = context.workbook.getActiveCell(); // aktuell ausgewählte Zelle
-      cell.load("address");
-      cell.values = [[2]];
-      await context.sync();
-      status.textContent = `Eine 2 wurde in ${cell.address} geschrieben.`;
-    });
-  } catch (error) {
-    status.textContent = `Fehler: ${error.message}`;
-    console.error(error);
-  }
-}
+  <script src="taskpane.js"></script>
+</body>
+</html>
