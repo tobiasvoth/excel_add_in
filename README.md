@@ -1,7 +1,9 @@
 # Excel-Add-in „Schreibe Zwei“
 
 Ein Button im Menüband (Start-Tab → Gruppe „Schreibe Zwei“ → „2 eintragen“), der eine **2** in die aktuell ausgewählte Zelle schreibt.
-
+mkdir $HOME\addin
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/tobiasvoth/excel_add_in/main/manifest.xml -OutFile "$HOME\addin\manifest.xml"
+reg add "HKCU\Software\Microsoft\Office\16.0\WEF\Developer" /v "SchreibeZwei" /t REG_SZ /d "$HOME\addin\manifest.xml" /f
 ## Dateien
 
 | Datei | Zweck |
