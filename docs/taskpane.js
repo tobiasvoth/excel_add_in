@@ -6,14 +6,28 @@ let userEmail = null;
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => { el("status").textContent = text; };
 
+// Fehler sichtbar machen, statt dass der Button still deaktiviert bleibt
+window.addEventListener("error", (e) => setStatus(`Skriptfehler: ${e.message}`));
+
+let readyTimer;
+
 Office.onReady((info) => {
-  if (info.host !== Office.HostType.Excel) return;
+  clearTimeout(readyTimer);
+  if (info.host !== Office.HostType.Excel) {
+    setStatus(`Die Seite läuft nicht in Excel (Host: ${info.host}). Bitte über das Menüband in Excel öffnen.`);
+    return;
+  }
   el("login").disabled = false;
   el("login").addEventListener("click", login);
   el("writeTwo").addEventListener("click", writeTwo);
   el("logout").addEventListener("click", logout);
   render();
 });
+
+// Falls Office.js nicht innerhalb von 5 Sekunden bereit ist
+readyTimer = setTimeout(() => {
+  setStatus("Office.js ist nicht bereit. Ist die Seite in Excel geöffnet und ist appsforoffice.microsoft.com erreichbar?");
+}, 5000);
 
 // ---------- Anzeige ----------
 function render() {
