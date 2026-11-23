@@ -1,12 +1,12 @@
 // Läuft in der Seitenleiste (Task Pane).
-// Ablauf: Google-Login im Dialog -> ID-Token -> Backend prüft Token + Freigabe -> Wert in Zelle schreiben.
+// Ablauf: Google-Login im Dialog -> ID-Token -> Apps Script prüft Token -> Wert in aktive Zelle schreiben.
 let idToken = null;
 let userEmail = null;
 
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => { el("status").textContent = text; };
 
-// Fehler sichtbar machen, statt dass der Button still deaktiviert bleibt
+// Fehler sichtbar machen, statt dass etwas still scheitert
 window.addEventListener("error", (e) => setStatus(`Skriptfehler: ${e.message}`));
 
 let readyTimer;
@@ -101,8 +101,37 @@ function logout() {
   render();
 }
 
+// ---------- Aufruf von Apps Script ----------
+async function callBackend(action) {
+  let res;
+  try {
+    // text/plain vermeidet die CORS-Preflight-Anfrage, die Apps Script nicht beantwortet
+    res = await fetch(CONFIG.API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ idToken, action })
+    });
+  } catch (e) {
+    throw new Error(
+      "Das Backend ist nicht erreichbar oder wurde von Google blockiert. " +
+      "Steht die Web-App auf „Zugriff: Jeder“ und stimmt API_URL in config.js?"
+    );
+  }
+
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(
+      `Das Backend hat keine gültige Antwort geliefert (Status ${res.status}). ` +
+      "Meist ist das die Google-Anmeldeseite: Web-App auf „Zugriff: Jeder“ stellen und eine neue Version bereitstellen."
+    );
+  }
+}
+
 // ---------- Wert vom Backend holen und in die aktive Zelle schreiben ----------
 async function writeTwo() {
+  const button = el("writeTwo");
   setStatus("");
 
   if (!tokenIsValid()) {
@@ -111,16 +140,12 @@ async function writeTwo() {
     return;
   }
 
-  try {
-    // text/plain vermeidet die CORS-Preflight-Anfrage, die Apps Script nicht beantwortet
-    const res = await fetch(CONFIG.API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ idToken, action: "value" })
-    });
-    if (!res.ok) throw new Error(`Backend antwortet mit Status ${res.status}`);
+  button.disabled = true;
+  setStatus("Rufe Backend auf …");
 
-    const data = await res.json();
+  try {
+    const data = await callBackend("value");
+
     if (!data.ok) {
       if (data.error === "not_signed_in") {
         logout();
@@ -128,21 +153,22 @@ async function writeTwo() {
       } else if (data.error === "not_allowed") {
         setStatus("Du bist für diese Funktion nicht freigegeben.");
       } else {
-        setStatus(`Fehler im Backend (${data.error}).`);
+        setStatus(`Fehler im Backend (${data.error}). Im Apps-Script-Editor unter „Ausführungen“ steht die Ursache.`);
       }
       return;
     }
-    const value = data.value;
 
     await Excel.run(async (context) => {
       const cell = context.workbook.getActiveCell();
       cell.load("address");
-      cell.values = [[value]];
+      cell.values = [[data.value]];
       await context.sync();
-      setStatus(`Der Wert ${value} wurde in ${cell.address} geschrieben.`);
+      setStatus(`Der Wert ${data.value} wurde in ${cell.address} geschrieben.`);
     });
   } catch (error) {
     setStatus(`Fehler: ${error.message}`);
     console.error(error);
+  } finally {
+    button.disabled = false;
   }
 }
