@@ -1,51 +1,117 @@
 <!DOCTYPE html>
 <html lang="de">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Schreibe Zwei</title>
-  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: "Segoe UI", sans-serif; margin: 16px; }
-    h3 { margin-top: 0; }
-    button {
-      width: 100%;
-      padding: 10px 14px;
-      margin-bottom: 8px;
-      font-size: 14px;
-      font-family: inherit;
-      color: #fff;
-      background: #217346;
-      border: 0;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    button.secondary { background: #5f6368; }
-    button:hover { filter: brightness(0.92); }
-    button:disabled { opacity: 0.5; cursor: default; }
-    #user { font-size: 13px; margin: 0 0 12px; }
-    #status { margin-top: 12px; font-size: 13px; min-height: 1.4em; }
-    [hidden] { display: none !important; }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cube</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; margin: 12px; color: #202124; background: #fff; }
+  h3 { font-size: 13px; margin: 14px 0 4px; }
+  select, input[type=number], input[type=search], input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  .small { font-size: 12px; color: #5f6368; margin: 2px 0; }
+  .list { max-height: 170px; overflow: auto; border: 1px solid #dadce0; padding: 4px 6px; border-radius: 4px; }
+  .grp { font-weight: bold; margin: 8px 0 2px; color: #3c4043; }
+  .list label { display: block; margin: 2px 0; cursor: pointer; }
+  button { margin-top: 12px; width: 100%; padding: 10px; background: #217346; color: #fff;
+           border: 0; border-radius: 4px; font-size: 14px; font-family: inherit; cursor: pointer; }
+  button.sec { background: #fff; color: #217346; border: 1px solid #dadce0; padding: 6px; font-size: 12px; }
+  button:disabled { background: #9aa0a6; color: #fff; cursor: default; }
+  button.sec:disabled { background: #f1f3f4; color: #9aa0a6; }
+  #status { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #dadce0;
+            margin-top: 10px; padding: 8px 0; min-height: 18px; white-space: pre-wrap; }
+  .err { color: #d93025; }
+  [hidden] { display: none !important; }
+
+  .userbar { display: flex; align-items: center; gap: 8px; }
+  .userbar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .userbar button { width: auto; margin-top: 0; padding: 4px 8px; }
+
+  /* Filter */
+  .frow { border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; }
+  .frow select, .frow input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; margin-bottom: 4px; }
+  .frow button { margin-top: 2px; }
+  #addFilter { margin-top: 6px; }
+
+  /* Gespeicherte Abfragen */
+  .srow { display: flex; align-items: center; gap: 6px; border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; }
+  .srow .sinfo { flex: 1; min-width: 0; }
+  .srow .sname { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srow button { width: auto; margin-top: 0; padding: 4px 8px; }
+  #refreshAll { margin-top: 6px; }
+</style>
 </head>
 <body>
-  <h3>Schreibe Zwei</h3>
 
+  <!-- Nicht angemeldet -->
   <div id="loggedOut">
+    <h3 style="margin-top:0">Cube</h3>
     <p>Bitte zuerst mit Google anmelden.</p>
     <button id="login" disabled>Mit Google anmelden</button>
   </div>
 
-  <div id="loggedIn" hidden>
-    <p id="user"></p>
-    <button id="writeTwo">2 eintragen</button>
-    <button id="logout" class="secondary">Abmelden</button>
+  <!-- Angemeldet: gleiche Oberfläche wie die Sheets-Seitenleiste -->
+  <div id="app" hidden>
+    <div class="userbar"><span id="user" class="small"></span><button id="logout" class="sec">Abmelden</button></div>
+
+    <h3>Gespeicherte Abfragen</h3>
+    <div id="saved"></div>
+    <div id="savedEmpty" class="small">Noch keine gespeicherten Abfragen. Gib unten bei „Abfrage merken“ einen Namen an und schreibe die Daten in die Tabelle.</div>
+    <button id="refreshAll" class="sec" style="display:none" onclick="refreshAll()">Alle aktualisieren</button>
+
+    <h3>Neue Abfrage</h3>
+    <input type="search" id="search" placeholder="Felder suchen …" oninput="applyFilter()">
+
+    <h3>Measures <span id="cm" class="small"></span></h3>
+    <div id="measures" class="list"></div>
+
+    <h3>Dimensions <span id="cd" class="small"></span></h3>
+    <div id="dimensions" class="list"></div>
+    <div class="small">Ausgegraute Felder lassen sich nicht mit deiner Auswahl kombinieren (kein Join-Pfad im Cube-Modell). Mit der Maus über einen Cube-Namen fahren zeigt die kombinierbaren Cubes.</div>
+
+    <h3>Filter</h3>
+    <div id="filters"></div>
+    <button id="addFilter" class="sec" onclick="addFilter()">+ Filter hinzufügen</button>
+    <div class="small">Filter beziehen sich auf die gewählten Dimensions. Mehrere Werte mit Semikolon trennen (= „oder“). Mehrere Filter gelten zusammen („und“). Zeitdimensionen filterst du über „Zeitraum“.</div>
+
+    <h3>Zeitraum</h3>
+    <select id="timedim" onchange="refreshCompat()"><option value="">– kein Zeitfilter –</option></select>
+    <div class="row" style="margin-top:6px">
+      <div><div class="small">Jahr</div><input type="number" id="y1" placeholder="2024" min="1900" max="2100"></div>
+      <div><div class="small">bis Jahr (optional)</div><input type="number" id="y2" placeholder="" min="1900" max="2100"></div>
+    </div>
+    <div class="small" style="margin-top:6px">Gruppieren nach</div>
+    <select id="gran">
+      <option value="">Keine Zeitspalte</option>
+      <option value="year">Jahr</option>
+      <option value="quarter">Quartal</option>
+      <option value="month">Monat</option>
+      <option value="week">Woche</option>
+      <option value="day">Tag</option>
+    </select>
+
+    <h3>Max. Zeilen</h3>
+    <input type="number" id="limit" value="1000" min="1" max="50000">
+
+    <h3>Abfrage merken (optional)</h3>
+    <input type="text" id="saveName" placeholder="Name, z. B. Umsatz je Kunde 2024">
+    <div class="small">Mit Name wird die Abfrage samt Zielzelle in dieser Arbeitsmappe gespeichert. Ein bereits vergebener Name wird überschrieben.</div>
+
+    <button id="go" onclick="run()">In Tabelle schreiben</button>
+    <button class="sec" onclick="clearAll()">Auswahl löschen</button>
+    <div class="small">Das Ergebnis beginnt in der aktuell markierten Zelle.</div>
+
+    <h3>Werkzeuge</h3>
+    <button class="sec" style="margin-top:4px" onclick="writeJoinGroups()">Kombinierbare Cubes in Tabelle schreiben</button>
+    <button class="sec" style="margin-top:6px" onclick="writeMeta()">Cube-Übersicht in Tabelle schreiben</button>
   </div>
 
-  <p id="status" role="status"></p>
+  <div id="status" role="status"></div>
+  <div id="build" class="small"></div>
 
-  <script src="config.js"></script>
-  <script src="taskpane.js"></script>
+  <script src="config.js?v=cube1"></script>
+  <script src="taskpane.js?v=cube1"></script>
 </body>
 </html>

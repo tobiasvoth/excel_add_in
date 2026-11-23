@@ -7,11 +7,11 @@
   xsi:type="TaskPaneApp">
 
   <Id>cd5c61d5-718f-42cb-b69a-7a723d9c98bc</Id>
-  <Version>1.0.0.2</Version>
+  <Version>1.0.1.0</Version>
   <ProviderName>Mein Name</ProviderName>
   <DefaultLocale>de-DE</DefaultLocale>
-  <DisplayName DefaultValue="Schreibe Zwei"/>
-  <Description DefaultValue="Öffnet eine Seitenleiste mit einem Button, der eine 2 in die aktive Zelle schreibt."/>
+  <DisplayName DefaultValue="Cube"/>
+  <Description DefaultValue="Cube-Abfragen in Excel: Felder auswählen, Daten in die Tabelle schreiben und gespeicherte Abfragen aktualisieren."/>
   <IconUrl DefaultValue="https://tobiasvoth.github.io/excel_add_in/assets/icon-32.png"/>
   <HighResolutionIconUrl DefaultValue="https://tobiasvoth.github.io/excel_add_in/assets/icon-80.png"/>
   <SupportUrl DefaultValue="https://tobiasvoth.github.io/excel_add_in/taskpane.html"/>
@@ -78,11 +78,11 @@
         <bt:Url id="Taskpane.Url" DefaultValue="https://tobiasvoth.github.io/excel_add_in/taskpane.html"/>
       </bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="CommandsGroup.Label" DefaultValue="Schreibe Zwei"/>
-        <bt:String id="TaskpaneButton.Label" DefaultValue="Seitenleiste"/>
+        <bt:String id="CommandsGroup.Label" DefaultValue="Cube"/>
+        <bt:String id="TaskpaneButton.Label" DefaultValue="Cube"/>
       </bt:ShortStrings>
       <bt:LongStrings>
-        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Öffnet die Seitenleiste mit dem Button „2 eintragen“."/>
+        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Öffnet die Cube-Seitenleiste."/>
       </bt:LongStrings>
     </Resources>
   </VersionOverrides>
