@@ -1,0 +1,13 @@
+{
+  "timeZone": "Europe/Berlin",
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8",
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/script.external_request",
+    "https://www.googleapis.com/auth/cloud-platform"
+  ],
+  "urlFetchWhitelist": [
+    "https://cubeproxy-554034917596.europe-west1.run.app/",
+    "https://iamcredentials.googleapis.com/"
+  ]
+}
