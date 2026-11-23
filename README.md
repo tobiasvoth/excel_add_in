@@ -215,7 +215,7 @@ initiales Laden und aktualisieren mit folgenden Befehlen
 
 mkdir $HOME\addin
 
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/tobiasvoth/excel_add_in/main/manifest.xml -OutFile "$HOME\addin\manifest.xml"
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/tobiasvoth/excel_add_in/main/docs/manifest.xml -OutFile "$HOME\addin\manifest.xml"
 
 reg add "HKCU\Software\Microsoft\Office\16.0\WEF\Developer" /v "SchreibeZwei" /t REG_SZ /d "$HOME\addin\manifest.xml" /f
 
