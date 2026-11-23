@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script>
+const CLIENT_ID = "DEINE_CLIENT_ID.apps.googleusercontent.com";
+
+Office.onReady(() => {
+  const hash = new URLSearchParams(location.hash.substring(1));
+  if (hash.get("access_token") || hash.get("error")) {
+    // Rückkehr von Google: Token an das Taskpane schicken
+    Office.context.ui.messageParent(JSON.stringify({
+      token: hash.get("access_token"),
+      error: hash.get("error"),
+      state: hash.get("state")
+    }));
+  } else {
+    // Start: zu Google weiterleiten
+    const state = new URLSearchParams(location.search).get("state");
+    location.href = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
+      client_id: CLIENT_ID,
+      redirect_uri: location.origin + "/dialog.html",
+      response_type: "token",
+      scope: "https://www.googleapis.com/auth/userinfo.email",
+      state: state,
+      prompt: "select_account"
+    });
+  }
+});
+</script>
+</body>
+</html>
