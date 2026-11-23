@@ -1,36 +1,23 @@
-// Seitenleiste: Login mit Google -> Apps-Script-Web-App aufrufen -> Ergebnis in aktive Zelle schreiben.
-// Benötigt config.js (window.CONFIG) und login.html + auth-callback.html im selben Ordner.
+// Seitenleiste: Login mit Google -> Apps Script API (scripts.run) aufrufen -> Ergebnis in aktive Zelle schreiben.
+// Benötigt config.js (window.CONFIG) sowie login.html und auth-callback.html im selben Ordner.
 
-const TOKEN_KEY = "schreibeZwei.idToken";
+const SESSION_KEY = "schreibeZwei.session";
 const $ = (id) => document.getElementById(id);
 
-// ---------- Hilfsfunktionen ----------
+// ---------- Sitzung (Token im localStorage der Seitenleiste) ----------
 
-function decodeJwt(token) {
-  const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-  const json = decodeURIComponent(
-    atob(payload)
-      .split("")
-      .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-      .join("")
-  );
-  return JSON.parse(json);
-}
-
-function clearToken() {
-  try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* ignorieren */ }
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) { /* ignorieren */ }
 }
 
 // Liefert { token, email } oder null, wenn nicht angemeldet / Token abgelaufen.
 function getSession() {
   try {
-    const token = localStorage.getItem(TOKEN_KEY);
-    if (!token) return null;
-    const claims = decodeJwt(token);
-    if (claims.exp * 1000 < Date.now() + 30000) { clearToken(); return null; }
-    return { token, email: claims.email };
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+    if (!s || !s.token || s.exp < Date.now() + 30000) { clearSession(); return null; }
+    return s;
   } catch (e) {
-    clearToken();
+    clearSession();
     return null;
   }
 }
@@ -42,19 +29,19 @@ function setStatus(text, isError) {
 }
 
 function render() {
-  const session = getSession();
-  $("loggedOut").hidden = !!session;
-  $("loggedIn").hidden = !session;
-  if (session) $("user").textContent = "Angemeldet als " + session.email;
+  const s = getSession();
+  $("loggedOut").hidden = !!s;
+  $("loggedIn").hidden = !s;
+  if (s) $("user").textContent = "Angemeldet" + (s.email ? " als " + s.email : "");
 }
 
-// ---------- Login ----------
+// ---------- Login (Dialog -> Google -> auth-callback.html) ----------
 
 function login() {
   return new Promise((resolve, reject) => {
-    const nonce = crypto.randomUUID();
+    const state = crypto.randomUUID();
     const url = new URL("login.html", location.href);
-    url.searchParams.set("nonce", nonce);
+    url.searchParams.set("state", state);
 
     Office.context.ui.displayDialogAsync(url.href, { height: 60, width: 30 }, (res) => {
       if (res.status !== Office.AsyncResultStatus.Succeeded) {
@@ -62,14 +49,27 @@ function login() {
       }
       const dialog = res.value;
 
-      dialog.addEventHandler(Office.EventType.DialogMessageReceived, (arg) => {
+      dialog.addEventHandler(Office.EventType.DialogMessageReceived, async (arg) => {
         dialog.close();
         try {
           const msg = JSON.parse(arg.message);
-          if (msg.error || !msg.idToken) throw new Error(msg.error || "Kein Token erhalten");
-          const claims = decodeJwt(msg.idToken);
-          if (claims.nonce !== nonce) throw new Error("Nonce stimmt nicht überein");
-          localStorage.setItem(TOKEN_KEY, msg.idToken);
+          if (msg.error || !msg.accessToken) throw new Error(msg.error || "Kein Token erhalten");
+          if (msg.state !== state) throw new Error("State stimmt nicht überein");
+
+          // E-Mail nur für die Anzeige abfragen
+          let email = "";
+          try {
+            const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+              headers: { Authorization: "Bearer " + msg.accessToken }
+            });
+            email = (await r.json()).email || "";
+          } catch (e) { /* nur Anzeige, kein Abbruch */ }
+
+          localStorage.setItem(SESSION_KEY, JSON.stringify({
+            token: msg.accessToken,
+            email: email,
+            exp: Date.now() + msg.expiresIn * 1000
+          }));
           resolve(getSession());
         } catch (e) {
           reject(e);
@@ -84,38 +84,49 @@ function login() {
   });
 }
 
-// ---------- API-Aufruf ----------
+// ---------- Apps Script API ----------
 
-async function callApi(action, retry = true) {
+function explainHttpError(status, data) {
+  const apiMsg = data && data.error && data.error.message ? " (" + data.error.message + ")" : "";
+  if (status === 404) {
+    return "Skript nicht gefunden" + apiMsg + ". Prüfe: Deployment-ID in config.js, Typ „API-Ausführbare Datei“, " +
+      "und ob das Skript mit demselben Google-Cloud-Projekt wie die OAuth-Client-ID verknüpft ist.";
+  }
+  if (status === 403) {
+    return "Zugriff verweigert" + apiMsg + ". Prüfe: Ist die Apps Script API im Cloud-Projekt aktiviert und " +
+      "darf dein Konto die Bereitstellung nutzen (Wer hat Zugriff)?";
+  }
+  return "HTTP " + status + apiMsg;
+}
+
+async function runScript(functionName, retry = true) {
   const session = getSession() || (await login());
 
-  // "text/plain" und keine eigenen Header => einfacher Request ohne CORS-Preflight.
-  // (Apps Script beantwortet keine Preflight-Requests.)
-  const res = await fetch(CONFIG.API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action, idToken: session.token })
-  });
+  const res = await fetch(
+    "https://script.googleapis.com/v1/scripts/" + encodeURIComponent(CONFIG.DEPLOYMENT_ID) + ":run",
+    {
+      method: "POST",
+      headers: { Authorization: "Bearer " + session.token, "Content-Type": "application/json" },
+      body: JSON.stringify({ function: functionName, parameters: [] })
+    }
+  );
 
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error(
-      "Antwort ist kein JSON (HTTP " + res.status + "). Ist die Web-App für „Jeder“ freigegeben " +
-      "und als neue Version bereitgestellt?"
-    );
-  }
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* keine JSON-Antwort */ }
 
-  if (data.ok) return data.result;
-
-  if (data.code === "AUTH" && retry) {
-    clearToken();
+  if (res.status === 401 && retry) {
+    clearSession();
     await login();
-    return callApi(action, false);
+    return runScript(functionName, false);
   }
-  throw new Error(data.error || "Unbekannter Fehler");
+  if (!res.ok) throw new Error(explainHttpError(res.status, data));
+
+  // HTTP 200, aber das Skript hat einen Fehler geworfen (z. B. "Kein Zugriff für ...")
+  if (data.error) {
+    const detail = data.error.details && data.error.details[0];
+    throw new Error((detail && detail.errorMessage) || data.error.message || "Skriptfehler");
+  }
+  return data.response ? data.response.result : undefined;
 }
 
 // ---------- Hauptfunktion ----------
@@ -125,7 +136,7 @@ async function writeTwoToActiveCell() {
   btn.disabled = true;
   setStatus("Rufe Apps Script auf …");
   try {
-    const result = await callApi("getTwo");
+    const result = await runScript("getTwo");
     await Excel.run(async (ctx) => {
       ctx.workbook.getActiveCell().values = [[result]];
       await ctx.sync();
@@ -160,7 +171,7 @@ Office.onReady(() => {
   $("writeTwo").onclick = writeTwoToActiveCell;
 
   $("logout").onclick = () => {
-    clearToken();
+    clearSession();
     setStatus("Abgemeldet.");
     render();
   };

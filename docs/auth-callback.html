@@ -9,10 +9,12 @@
   <p>Anmeldung abgeschlossen …</p>
   <script>
     Office.onReady(() => {
-      // Google hängt das ID-Token hinter das # an die URL
+      // Google hängt das Access-Token hinter das # an die URL
       const h = new URLSearchParams(location.hash.substring(1));
       Office.context.ui.messageParent(JSON.stringify({
-        idToken: h.get("id_token"),
+        accessToken: h.get("access_token"),
+        expiresIn: Number(h.get("expires_in") || 3600),
+        state: h.get("state"),
         error: h.get("error")
       }));
     });
