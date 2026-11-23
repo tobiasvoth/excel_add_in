@@ -112,22 +112,27 @@ async function writeTwo() {
   }
 
   try {
-    const res = await fetch(`${CONFIG.API_URL}/api/value`, {
-      headers: { Authorization: `Bearer ${idToken}` }
+    // text/plain vermeidet die CORS-Preflight-Anfrage, die Apps Script nicht beantwortet
+    const res = await fetch(CONFIG.API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ idToken, action: "value" })
     });
-
-    if (res.status === 401) {
-      logout();
-      setStatus("Nicht angemeldet. Bitte neu anmelden.");
-      return;
-    }
-    if (res.status === 403) {
-      setStatus("Du bist für diese Funktion nicht freigegeben.");
-      return;
-    }
     if (!res.ok) throw new Error(`Backend antwortet mit Status ${res.status}`);
 
-    const { value } = await res.json();
+    const data = await res.json();
+    if (!data.ok) {
+      if (data.error === "not_signed_in") {
+        logout();
+        setStatus("Nicht angemeldet. Bitte neu anmelden.");
+      } else if (data.error === "not_allowed") {
+        setStatus("Du bist für diese Funktion nicht freigegeben.");
+      } else {
+        setStatus(`Fehler im Backend (${data.error}).`);
+      }
+      return;
+    }
+    const value = data.value;
 
     await Excel.run(async (context) => {
       const cell = context.workbook.getActiveCell();
