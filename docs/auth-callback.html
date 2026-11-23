@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Anmeldung</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+</head>
+<body style="font-family: 'Segoe UI', sans-serif">
+  <p>Anmeldung abgeschlossen …</p>
+  <script>
+    Office.onReady(() => {
+      // Google hängt das ID-Token hinter das # an die URL
+      const h = new URLSearchParams(location.hash.substring(1));
+      Office.context.ui.messageParent(JSON.stringify({
+        idToken: h.get("id_token"),
+        error: h.get("error")
+      }));
+    });
+  </script>
+</body>
+</html>
