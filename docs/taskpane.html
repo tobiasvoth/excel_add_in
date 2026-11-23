@@ -12,6 +12,7 @@
     button {
       width: 100%;
       padding: 10px 14px;
+      margin-bottom: 8px;
       font-size: 14px;
       font-family: inherit;
       color: #fff;
@@ -20,17 +21,31 @@
       border-radius: 4px;
       cursor: pointer;
     }
-    button:hover { background: #1a5c38; }
-    button:disabled { opacity: 0.6; cursor: default; }
+    button.secondary { background: #5f6368; }
+    button:hover { filter: brightness(0.92); }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #user { font-size: 13px; margin: 0 0 12px; }
     #status { margin-top: 12px; font-size: 13px; min-height: 1.4em; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
   <h3>Schreibe Zwei</h3>
-  <p>Klicke in Excel eine Zelle an und dann auf den Button.</p>
-  <button id="writeTwo" disabled>2 eintragen</button>
+
+  <div id="loggedOut">
+    <p>Bitte zuerst mit Google anmelden.</p>
+    <button id="login" disabled>Mit Google anmelden</button>
+  </div>
+
+  <div id="loggedIn" hidden>
+    <p id="user"></p>
+    <button id="writeTwo">2 eintragen</button>
+    <button id="logout" class="secondary">Abmelden</button>
+  </div>
+
   <p id="status" role="status"></p>
 
+  <script src="config.js"></script>
   <script src="taskpane.js"></script>
 </body>
 </html>

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Anmeldung abgeschlossen</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+</head>
+<body style="font-family: 'Segoe UI', sans-serif">
+  <p>Anmeldung abgeschlossen. Dieses Fenster schließt sich gleich.</p>
+  <script>
+    Office.onReady(() => {
+      // Google liefert das ID-Token im Fragment (#id_token=...)
+      const hash = new URLSearchParams(location.hash.slice(1));
+      const message = hash.get("id_token")
+        ? { idToken: hash.get("id_token") }
+        : { error: hash.get("error") || "Keine Antwort von Google" };
+      Office.context.ui.messageParent(JSON.stringify(message));
+    });
+  </script>
+</body>
+</html>
