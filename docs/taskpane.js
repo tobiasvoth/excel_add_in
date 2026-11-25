@@ -2,14 +2,23 @@
 // Ablauf: Google-Login (Dialog) -> Apps Script API (scripts.run) -> Backend holt Daten von Cube
 // -> Ergebnis wird mit Office.js in die Tabelle geschrieben.
 // Benötigt config.js (window.CONFIG) sowie login.html und auth-callback.html im selben Ordner.
+// Backend: Backend.gs (getMeta, runCubeQuery(query, extras)).
 
-var BUILD = "cube1";
+var BUILD = "cube2";
 var SESSION_KEY = "cube.session"; // eigener Schlüssel: alte Tokens mit anderen Berechtigungen werden nicht genutzt
 var SAVED_KEY = "cube.saved";     // Name der Einstellung in der Arbeitsmappe
 var MAX_CELLS_PER_WRITE = 20000;  // große Ergebnisse in Portionen schreiben
 
-var META = [];
-var DIMS = {}; // Dimension-Name -> { title, type }
+var MAX_LIMIT = 50000;     // Höchstwert der Instanz
+var PRESET_LIMIT = 50000;  // Vorlagen werden vollständig geladen
+
+var META = [];             // alle Cubes und Views aus /meta
+var VIEWS = [];            // nur Views mit meta.case (Case-Modus)
+var CUR = null;            // im Case-Modus gewählte View
+var MODE = 'case';         // 'case' oder 'dev'
+var DIMS = {};             // Dimension-Name -> { title, short, type }
+var FMT = {};              // Measure-Name -> d3-Format (meta.format)
+var PRESET_FILTERS = [];   // Filter der geladenen Vorlage (unverändert weitergereicht)
 var started = false;
 
 // Operatoren je Datentyp (Cube-Filteroperatoren)
@@ -35,12 +44,14 @@ function $(id) { return document.getElementById(id); }
 
 function setStatus(msg, isErr) {
   var s = $('status');
-  s.textContent = msg || '';
-  s.className = isErr ? 'err' : '';
+  msg = msg || '';
+  s.textContent = msg;
+  s.className = isErr ? 'err' : (msg.indexOf('⚠') !== -1 ? 'warn' : '');
 }
 
 function setBusy(busy) {
   Array.prototype.forEach.call(document.querySelectorAll('button'), function (b) { b.disabled = busy; });
+  if (!busy) fillPresetsState();
 }
 
 // =====================================================================
@@ -167,10 +178,13 @@ async function runScript(functionName, parameters, retry) {
   return data.response ? data.response.result : undefined;
 }
 
-// Abfrage ausführen: liefert [Kopfzeile, Zeilen …] oder null (keine Daten)
-async function fetchTable(query) {
-  var res = await runScript('runCubeQuery', [query]);
-  return res && res.values && res.values.length ? res.values : null;
+// Abfrage ausführen: liefert { values, formats, warn } oder null (keine Daten).
+// formats: { 'view.measure': d3-Format } -> das Backend liefert daraus das Excel-Zahlenformat je Spalte.
+// Ein älteres Backend (nur { values }) funktioniert weiter, dann ohne Formate und ohne Limit-Hinweis.
+async function fetchTable(query, formats) {
+  var res = await runScript('runCubeQuery', [query, { formats: formats || {} }]);
+  if (!res || !res.values || !res.values.length) return null;
+  return { values: res.values, formats: res.formats || [], warn: res.warn || '' };
 }
 
 // =====================================================================
@@ -191,9 +205,25 @@ async function sheetExists(sheetId) {
   });
 }
 
+// Zahlenformat je Spalte setzen (nur Datenzeilen, nicht die Kopfzeile)
+async function applyFormats(ctx, sheet, row, col, rows, formats) {
+  if (!formats || rows < 2) return;
+  for (var c = 0; c < formats.length; c++) {
+    if (!formats[c]) continue;
+    for (var i = 1; i < rows; i += MAX_CELLS_PER_WRITE) {
+      var n = Math.min(MAX_CELLS_PER_WRITE, rows - i);
+      var fmt = [];
+      for (var k = 0; k < n; k++) fmt.push([formats[c]]);
+      sheet.getRangeByIndexes(row + i, col + c, n, 1).numberFormat = fmt;
+      await ctx.sync();
+    }
+  }
+}
+
 // Ohne target: ab der aktiven Zelle. Mit target ({ sheetId, row, col }, 0-basiert): an dieser Position.
+// formats (optional): Excel-Zahlenformat je Spalte oder null.
 // Liefert die geschriebene Position und Größe zurück.
-async function writeTable(values, target) {
+async function writeTable(values, target, formats) {
   return Excel.run(async function (ctx) {
     var sheet, row, col, sheetId;
     if (target) {
@@ -221,6 +251,7 @@ async function writeTable(values, target) {
       sheet.getRangeByIndexes(row + i, col, part.length, cols).values = part;
       await ctx.sync();
     }
+    await applyFormats(ctx, sheet, row, col, rows, formats);
     return { sheetId: sheetId, row: row, col: col, rows: rows, cols: cols };
   });
 }
@@ -262,13 +293,14 @@ async function storeSavedList(list) {
   });
 }
 
-async function saveQuery(name, query, target) {
+async function saveQuery(name, query, target, formats) {
   var list = await loadSavedList();
   var existing = list.filter(function (q) { return q.name === name; })[0];
   var entry = {
     id: existing ? existing.id : crypto.randomUUID(),
     name: name,
     query: query,
+    formats: formats || {},
     sheetId: target.sheetId,
     row: target.row,
     col: target.col,
@@ -314,21 +346,22 @@ async function deleteSavedQuery(id) {
   await storeSavedList(list.filter(function (q) { return q.id !== id; }));
 }
 
-// Holt frische Daten und schreibt sie an die gespeicherte Position.
+// Holt frische Daten und schreibt sie mit derselben Abfrage an die gespeicherte Position.
 // Erst abfragen, dann den alten Bereich leeren: bei einem Fehler bleiben die alten Daten stehen.
 async function refreshSaved(q) {
   if (!(await sheetExists(q.sheetId))) throw new Error('Das Zielblatt existiert nicht mehr.');
-  var values = await fetchTable(q.query);
+  var table = await fetchTable(q.query, q.formats);
   await clearArea(q);
 
   var msg;
-  if (!values) {
+  if (!table) {
     q.rows = 0; q.cols = 0;
     msg = 'Keine Daten';
   } else {
-    var t = await writeTable(values, q);
+    var t = await writeTable(table.values, q, table.formats);
     q.rows = t.rows; q.cols = t.cols;
-    msg = (values.length - 1) + ' Zeilen aktualisiert';
+    msg = (table.values.length - 1) + ' Zeilen aktualisiert';
+    if (table.warn) msg += '\n' + table.warn;
   }
   q.lastRun = new Date().toISOString();
   return msg;
@@ -435,17 +468,19 @@ async function refreshAll() {
   await withBusy('Aktualisiere alle …', async function () {
     var list = await loadSavedList();
     if (!list.length) return 'Keine gespeicherten Abfragen vorhanden.';
-    var ok = 0, failed = [];
+    var ok = 0, failed = [], truncated = [];
     for (var i = 0; i < list.length; i++) {
       try {
-        await refreshSaved(list[i]);
+        var r = await refreshSaved(list[i]);
         ok++;
+        if (r.indexOf('⚠') !== -1) truncated.push('„' + list[i].name + '“');
       } catch (e) {
         failed.push('„' + list[i].name + '“ (' + e.message + ')');
       }
     }
     await storeSavedList(list);
     var msg = ok + ' von ' + list.length + ' Abfragen aktualisiert';
+    if (truncated.length) msg += '. ⚠ Zeilenlimit erreicht bei: ' + truncated.join('; ');
     if (failed.length) msg += '. Fehler bei: ' + failed.join('; ');
     return msg;
   });
@@ -458,7 +493,7 @@ async function removeOne(id) {
 }
 
 // =====================================================================
-// Felder, Filter, Zeitraum (Oberfläche wie im Sheets-Add-on)
+// Start der Oberfläche: Cube-Modell laden
 // =====================================================================
 
 async function startApp() {
@@ -467,69 +502,251 @@ async function startApp() {
   setStatus('Lade Cube-Modell …');
   loadSaved();
   try {
-    META = (await runScript('getMeta')) || [];
-    renderFields();
-    setStatus('');
+    init((await runScript('getMeta')) || []);
   } catch (e) {
     started = false; // beim nächsten Versuch neu laden
     setStatus(e.message, true);
   }
 }
 
-function renderFields() {
+function init(meta) {
+  META = meta;
+  DIMS = {}; FMT = {};
+  META.forEach(function (c) {
+    c.dimensions.forEach(function (d) {
+      DIMS[d.name] = { title: c.title + ' › ' + d.title, short: d.title, type: d.type };
+    });
+    c.measures.forEach(function (m) { if (m.format) FMT[m.name] = m.format; });
+  });
+  // Case-Modus zeigt nur Views mit meta.case
+  VIEWS = META.filter(function (c) { return c.type === 'view' && c.caseName; });
+  fillViewSelect();
+  onModeChange();
+}
+
+// Anzeigename einer Dimension: im Case-Modus der Kurztitel, sonst mit Cube-Namen davor
+function dimTitle(n) {
+  var d = DIMS[n];
+  return !d ? n : (MODE === 'case' ? d.short : d.title);
+}
+
+// =====================================================================
+// Modus, Auswertung (View) und Vorlagen
+// =====================================================================
+
+// Auswahl: erste Ebene = meta.case (nach case_order), zweite Ebene = meta.view_label (nach view_order)
+function fillViewSelect() {
+  var sel = $('viewSel');
+  sel.textContent = '';
+  if (!VIEWS.length) {
+    var none = document.createElement('option');
+    none.value = ''; none.textContent = '– keine Views mit meta.case –';
+    sel.appendChild(none);
+    return;
+  }
+  var cases = {};
+  VIEWS.forEach(function (v) { (cases[v.caseName] = cases[v.caseName] || []).push(v); });
+  var minOrder = function (name) {
+    return Math.min.apply(null, cases[name].map(function (v) { return v.caseOrder; }));
+  };
+  Object.keys(cases)
+    .sort(function (a, b) { return minOrder(a) - minOrder(b) || a.localeCompare(b); })
+    .forEach(function (name) {
+      var g = document.createElement('optgroup');
+      g.label = name;
+      cases[name]
+        .sort(function (a, b) { return a.viewOrder - b.viewOrder || a.viewLabel.localeCompare(b.viewLabel); })
+        .forEach(function (v) {
+          var o = document.createElement('option');
+          o.value = v.name; o.textContent = v.viewLabel;
+          g.appendChild(o);
+        });
+      sel.appendChild(g);
+    });
+}
+
+function currentView() {
+  var name = $('viewSel').value;
+  return VIEWS.filter(function (v) { return v.name === name; })[0] || null;
+}
+
+function onModeChange() {
+  MODE = $('mode').value;
+  var dev = MODE === 'dev';
+  $('caseBox').style.display = dev ? 'none' : '';
+  $('devHint').style.display = dev ? '' : 'none';
+  $('granBox').style.display = dev ? '' : 'none';
+  CUR = dev ? null : currentView();
+  renderLists();
+  resetForm();
+  fillPresets();
+  if (!dev && !VIEWS.length) {
+    setStatus('Im Modell wurden keine Views mit meta.case gefunden. Über „Alle Cubes und Views“ stehen alle Felder zur Verfügung.', true);
+  }
+}
+
+function onViewChange() {
+  CUR = currentView();
+  renderLists();
+  resetForm();
+  fillPresets();
+}
+
+function fillPresets() {
+  var sel = $('preset');
+  sel.textContent = '';
+  var list = (MODE === 'case' && CUR) ? CUR.presets : [];
+  if (!list.length) {
+    var o = document.createElement('option');
+    o.value = ''; o.textContent = '– keine Vorlagen –';
+    sel.appendChild(o);
+  }
+  list.forEach(function (p) {
+    var o = document.createElement('option');
+    o.value = p.name; o.textContent = p.name;
+    sel.appendChild(o);
+  });
+  fillPresetsState();
+}
+
+function fillPresetsState() {
+  var has = !!(MODE === 'case' && CUR && CUR.presets.length);
+  $('preset').disabled = !has;
+  $('loadPresetBtn').disabled = !has;
+}
+
+function setPresetFilters(f) {
+  PRESET_FILTERS = f || [];
+  $('presetInfo').style.display = PRESET_FILTERS.length ? '' : 'none';
+  $('usePresetFilters').checked = true;
+}
+
+// Vorlage laden: füllt Kennzahlen, Spalten, Zeitraum und (unsichtbar) die Vorlagenfilter.
+// Danach kann die Nutzerin alles anpassen; die Vorlage selbst bleibt unverändert.
+function loadPreset() {
+  if (!CUR) return;
+  var name = $('preset').value;
+  var p = (CUR.presets || []).filter(function (x) { return x.name === name; })[0];
+  if (!p) { setStatus('Keine Vorlage gewählt.', true); return; }
+
+  resetForm();
+
+  var wanted = (p.measures || []).concat(p.dimensions || []);
+  var want = {}, found = {};
+  wanted.forEach(function (n) { want[n] = true; });
+  Array.prototype.forEach.call(document.querySelectorAll('.list input'), function (i) {
+    if (want[i.value]) { i.checked = true; found[i.value] = true; }
+  });
+  var missing = wanted.filter(function (n) { return !found[n]; });
+
+  if (p.time_dimension) $('timedim').value = p.time_dimension;
+  // Zeitraum tagesgenau und unverändert übernehmen
+  if (p.date_range && p.date_range.length === 2) {
+    $('d1').value = String(p.date_range[0]).slice(0, 10);
+    $('d2').value = String(p.date_range[1]).slice(0, 10);
+  }
+  $('limit').value = PRESET_LIMIT;
+  // Name vorbelegen, damit sich das Ergebnis später per Klick aktualisieren lässt
+  $('saveName').value = p.name + ' (' + CUR.viewLabel + ')';
+  setPresetFilters(p.filters || []);
+
+  updateCounts();
+  applyFilter();
+
+  if (missing.length) {
+    setStatus('Vorlage „' + p.name + '“ geladen, aber diese Felder gibt es in der View nicht: ' + missing.join(', '), true);
+  } else {
+    setStatus('Vorlage „' + p.name + '“ geladen. Mit „In Tabelle schreiben“ ausführen; der Name unter „Abfrage merken“ ist vorbelegt, damit du das Ergebnis später aktualisieren kannst.');
+  }
+}
+
+// =====================================================================
+// Felder, Filter, Zeitraum
+// =====================================================================
+
+// Felder einer View nach Ordnern (folders) gruppieren, Reihenfolge wie geliefert.
+// Felder ohne Ordner kommen unter „Weitere“ ans Ende.
+function folderGroups(view, kind) {
+  var byName = {}, used = {}, out = [];
+  view[kind].forEach(function (it) { byName[it.name] = it; });
+  (view.folders || []).forEach(function (f) {
+    var items = [];
+    (f.members || []).forEach(function (n) {
+      if (byName[n] && !used[n]) { items.push(byName[n]); used[n] = true; }
+    });
+    if (items.length) out.push({ label: f.name, items: items });
+  });
+  var rest = view[kind].filter(function (it) { return !used[it.name]; });
+  if (rest.length) out.push({ label: 'Weitere', items: rest });
+  return out;
+}
+
+// Baut Measures, Dimensions und Zeitdimensionen für den aktuellen Modus neu auf
+function renderLists() {
   var measures = $('measures'), dims = $('dimensions'), td = $('timedim');
   measures.textContent = ''; dims.textContent = '';
+  while (td.options.length > 1) td.remove(1);
+
   var members = {};
   META.forEach(function (c) {
     if (c.group) (members[c.group] = members[c.group] || []).push(c.title);
   });
-  META.forEach(function (c) {
-    var hint;
-    if (c.type === 'view') hint = 'View: nur Felder dieser View kombinieren';
-    else if (!c.group) hint = 'Keine Join-Information verfügbar';
-    else {
-      var others = members[c.group].filter(function (t) { return t !== c.title; });
-      hint = others.length ? 'Kombinierbar mit: ' + others.join(', ') : 'Keine Joins zu anderen Cubes';
+
+  var cubes = MODE === 'case' ? (CUR ? [CUR] : []) : META;
+  cubes.forEach(function (c) {
+    if (MODE === 'case') {
+      folderGroups(c, 'measures').forEach(function (g) { addGroup(measures, g.label, c.group, g.items, g.label); });
+      folderGroups(c, 'dimensions').forEach(function (g) { addGroup(dims, g.label, c.group, g.items, g.label); });
+    } else {
+      var hint;
+      if (c.type === 'view') hint = 'View: nur Felder dieser View kombinieren';
+      else if (!c.group) hint = 'Keine Join-Information verfügbar';
+      else {
+        var others = members[c.group].filter(function (t) { return t !== c.title; });
+        hint = others.length ? 'Kombinierbar mit: ' + others.join(', ') : 'Keine Joins zu anderen Cubes';
+      }
+      addGroup(measures, c.title, c.group, c.measures, hint);
+      addGroup(dims, c.title, c.group, c.dimensions, hint);
     }
-    addGroup(measures, c, c.measures, hint);
-    addGroup(dims, c, c.dimensions, hint);
     c.dimensions.forEach(function (d) {
-      DIMS[d.name] = { title: c.title + ' › ' + d.title, type: d.type };
       if (d.type === 'time') {
         var o = document.createElement('option');
         o.value = d.name;
         o.setAttribute('data-group', c.group);
-        o.textContent = c.title + ' › ' + d.title;
+        o.textContent = MODE === 'case' ? d.title : c.title + ' › ' + d.title;
         td.appendChild(o);
       }
     });
   });
-  measures.addEventListener('change', updateCounts);
-  dims.addEventListener('change', updateCounts);
   updateCounts();
 }
 
-function addGroup(box, cube, items, hint) {
+function addGroup(box, label, group, items, hint) {
   if (!items.length) return;
-  var cubeTitle = cube.title;
   var g = document.createElement('div');
   g.className = 'grp';
-  g.textContent = cubeTitle;
-  g.title = hint;
+  g.textContent = label;
+  g.title = hint || '';
   g.setAttribute('data-grp', '1');
-  g.setAttribute('data-group', cube.group);
+  g.setAttribute('data-group', group);
   box.appendChild(g);
   items.forEach(function (it) {
     var l = document.createElement('label');
     l.title = it.name;
     l.setAttribute('data-name', it.name);
-    l.setAttribute('data-group', cube.group);
-    l.setAttribute('data-text', (cubeTitle + ' ' + it.title + ' ' + it.name).toLowerCase());
+    l.setAttribute('data-group', group);
+    l.setAttribute('data-text', (label + ' ' + it.title + ' ' + it.name + ' ' + (it.explanation || '')).toLowerCase());
     var cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.value = it.name;
     l.appendChild(cb);
     l.appendChild(document.createTextNode(' ' + it.title));
+    if (it.explanation) {
+      var ex = document.createElement('div');
+      ex.className = 'small expl';
+      ex.textContent = it.explanation;
+      l.appendChild(ex);
+    }
     box.appendChild(l);
   });
 }
@@ -574,7 +791,8 @@ function selectedGroup() {
   return opt ? opt.getAttribute('data-group') || '' : '';
 }
 
-// Felder anderer Gruppen (kein Join-Pfad) ausgrauen und sperren
+// Felder anderer Gruppen (kein Join-Pfad) ausgrauen und sperren.
+// Im Case-Modus gehören alle Felder zur selben View, hier wird also nichts gesperrt.
 function refreshCompat() {
   var g = selectedGroup();
   Array.prototype.forEach.call(document.querySelectorAll('.list label, .list .grp'), function (el) {
@@ -593,6 +811,19 @@ function refreshCompat() {
     o.disabled = !!(g && og && og !== g);
   });
   if (td.options[td.selectedIndex].disabled) td.value = '';
+}
+
+// Standard-Zeitdimension: im Case-Modus view.report_date (sonst die erste Zeitdimension)
+function defaultTimeDim() {
+  if (MODE !== 'case' || !CUR) return '';
+  var opts = $('timedim').options, first = '';
+  for (var i = 0; i < opts.length; i++) {
+    var v = opts[i].value;
+    if (!v) continue;
+    if (/\.report_date$/.test(v)) return v;
+    if (!first) first = v;
+  }
+  return first;
 }
 
 // ---------- Filter ----------
@@ -631,7 +862,7 @@ function fillDims(row) {
   }
   names.forEach(function (n) {
     var o = document.createElement('option');
-    o.value = n; o.textContent = DIMS[n].title;
+    o.value = n; o.textContent = dimTitle(n);
     dim.appendChild(o);
   });
   if (names.indexOf(old) !== -1) dim.value = old;
@@ -677,7 +908,7 @@ function collectFilters() {
       out.push({ member: member, operator: op });
     } else {
       var values = raw.split(';').map(function (s) { return s.trim(); }).filter(Boolean);
-      if (!values.length) return { error: 'Bitte einen Wert für den Filter „' + DIMS[member].title + '“ eingeben.' };
+      if (!values.length) return { error: 'Bitte einen Wert für den Filter „' + dimTitle(member) + '“ eingeben.' };
       out.push({ member: member, operator: op, values: values });
     }
   }
@@ -685,13 +916,27 @@ function collectFilters() {
 }
 
 // ---------- Zurücksetzen, Abfrage bauen, ausführen ----------
-function clearAll() {
+// Setzt Auswahl, Filter, Zeitraum, Limit, Name und Vorlagenfilter zurück
+// (Modus, gewählte View und Vorlagenliste bleiben erhalten).
+function resetForm() {
   Array.prototype.forEach.call(document.querySelectorAll('.list input'), function (i) { i.checked = false; });
-  $('timedim').value = ''; $('y1').value = ''; $('y2').value = ''; $('gran').value = '';
+  $('d1').value = ''; $('d2').value = ''; $('gran').value = '';
   $('search').value = '';
   $('saveName').value = '';
   $('filters').textContent = '';
+  $('limit').value = 1000;
+  setPresetFilters([]);
+  $('timedim').value = defaultTimeDim();
   applyFilter(); updateCounts(); setStatus('');
+}
+
+function clearAll() { resetForm(); }
+
+// d3-Formate (meta.format) der gewählten Measures; das Backend macht daraus die Excel-Zahlenformate
+function formatsFor(measures) {
+  var out = {};
+  measures.forEach(function (m) { if (FMT[m]) out[m] = FMT[m]; });
+  return out;
 }
 
 function buildQuery() {
@@ -699,29 +944,34 @@ function buildQuery() {
   if (!measures.length && !dimensions.length) {
     return { error: 'Wähle mindestens ein Measure oder eine Dimension.' };
   }
-  var query = { measures: measures, dimensions: dimensions, limit: parseInt($('limit').value, 10) || 1000 };
 
-  var dim = $('timedim').value, y1 = $('y1').value.trim(), y2 = $('y2').value.trim(), gran = $('gran').value;
-  if ((y1 || y2 || gran) && !dim) {
-    return { error: 'Wähle eine Zeitdimension für Jahr oder Gruppierung.' };
+  var limit = parseInt($('limit').value, 10) || 1000;
+  if (limit > MAX_LIMIT) return { error: 'Max. Zeilen: höchstens 50.000 (Limit der Instanz).' };
+  var query = { measures: measures, dimensions: dimensions, limit: limit };
+
+  // Zeitraum: tagesgenau, ohne Rundung. Im Case-Modus ohne Granularität
+  // (Jahr, Monat und Tag kommen als Dimensions aus der Kalender-Gruppe).
+  var dim = $('timedim').value, d1 = $('d1').value, d2 = $('d2').value;
+  var gran = MODE === 'dev' ? $('gran').value : '';
+  if ((d1 || d2 || gran) && !dim) {
+    return { error: 'Wähle eine Zeitdimension für Zeitraum oder Gruppierung.' };
   }
-  if (dim) {
+  if ((d1 && !d2) || (!d1 && d2)) {
+    return { error: 'Bitte Anfang („von“) und Ende („bis“) des Zeitraums angeben.' };
+  }
+  if (d1 && d2 && d2 < d1) return { error: '„bis“ darf nicht vor „von“ liegen.' };
+  if (dim && (d1 || gran)) {
     var td = { dimension: dim };
-    if (y1 || y2) {
-      var from = parseInt(y1 || y2, 10), to = parseInt(y2 || y1, 10);
-      if (!(from >= 1900 && from <= 2100 && to >= 1900 && to <= 2100)) {
-        return { error: 'Jahr bitte vierstellig angeben (1900–2100).' };
-      }
-      if (to < from) return { error: '„bis Jahr“ muss gleich oder größer als „Jahr“ sein.' };
-      td.dateRange = [from + '-01-01', to + '-12-31'];
-    }
+    if (d1) td.dateRange = [d1, d2];
     if (gran) td.granularity = gran;
     query.timeDimensions = [td];
   }
 
+  // Filter: Vorlagenfilter unverändert, dazu die Filter der Nutzerin (alle gelten zusammen: „und“)
   var f = collectFilters();
   if (f.error) return { error: f.error };
-  if (f.filters.length) query.filters = f.filters;
+  var all = ($('usePresetFilters').checked ? PRESET_FILTERS : []).concat(f.filters);
+  if (all.length) query.filters = all;
 
   return { query: query };
 }
@@ -732,16 +982,18 @@ async function run() {
   var b = buildQuery();
   if (b.error) { setStatus(b.error, true); return; }
   var name = $('saveName').value.trim();
+  var formats = formatsFor(b.query.measures);
 
   var ok = await withBusy('Abfrage läuft …', async function () {
-    var values = await fetchTable(b.query);
-    if (!values) return 'Keine Daten' + (name ? ' (nicht gespeichert)' : '');
-    var target = await writeTable(values);
-    var msg = (values.length - 1) + ' Zeilen geschrieben';
+    var table = await fetchTable(b.query, formats);
+    if (!table) return 'Keine Daten' + (name ? ' (nicht gespeichert)' : '');
+    var target = await writeTable(table.values, null, table.formats);
+    var msg = (table.values.length - 1) + ' Zeilen geschrieben';
     if (name) {
-      await saveQuery(name, b.query, target);
+      await saveQuery(name, b.query, target, formats);
       msg += ' · als „' + name + '“ gespeichert';
     }
+    if (table.warn) msg += '\n' + table.warn;
     return msg;
   });
   if (ok && name) await loadSaved();
@@ -793,6 +1045,9 @@ async function writeJoinGroups() {
 Office.onReady(function () {
   var id = (window.CONFIG && CONFIG.DEPLOYMENT_ID) || '';
   $('build').textContent = 'Build ' + BUILD + ' · Deployment-ID: ' + (id ? id.slice(0, 10) + '…' : 'FEHLT');
+
+  $('measures').addEventListener('change', updateCounts);
+  $('dimensions').addEventListener('change', updateCounts);
 
   $('login').disabled = false;
   renderAuth();
