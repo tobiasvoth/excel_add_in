@@ -38,6 +38,19 @@
   #addFilter { margin-top: 6px; }
   #presetInfo { border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; background: #f8f9fa; }
 
+  /* Pivot-Editor */
+  #pivotBox { margin-top: 8px; }
+  #pivotBox label { display: block; margin: 4px 0; }
+  .zone { border: 1px dashed #9aa0a6; border-radius: 4px; padding: 4px 6px; margin: 6px 0; min-height: 34px; background: #fafafa; }
+  .zone.over { border-color: #217346; background: #e6f4ea; }
+  .zone .zhead { font-weight: bold; font-size: 12px; color: #3c4043; margin-bottom: 2px; }
+  .zempty { font-size: 12px; color: #80868b; }
+  .chip { display: flex; align-items: center; gap: 4px; background: #fff; border: 1px solid #dadce0; border-radius: 4px; padding: 3px 6px; margin: 3px 0; cursor: grab; }
+  .chip .ctitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip select { width: auto; padding: 2px; font-size: 12px; }
+  .chip button { width: auto; margin-top: 0; padding: 0 4px; background: none; color: #5f6368; border: 0; font-size: 12px; }
+  .chip button:disabled { background: none; color: #bdc1c6; }
+
   /* Gespeicherte Abfragen */
   .srow { display: flex; align-items: center; gap: 6px; border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; }
   .srow .sinfo { flex: 1; min-width: 0; }
@@ -88,6 +101,23 @@
       </div>
     </div>
 
+    <div class="small" style="margin-top:10px">Ausgabe</div>
+    <select id="output" onchange="onOutputChange()">
+      <option value="flat">Tabelle (flach)</option>
+      <option value="pivot">Pivot-Tabelle (Felder ziehen)</option>
+    </select>
+
+    <!-- Pivot-Editor: Felder aus den Listen unten hierher ziehen -->
+    <div id="pivotBox" style="display:none">
+      <div class="small">Felder aus den Listen unten in die Bereiche ziehen (oder dort anhaken). Das Add-in holt die Daten im Hintergrund, pivotiert sie selbst und schreibt nur das fertige Ergebnis ab der markierten Zelle ins Blatt (keine Rohdaten, keine Excel-PivotTable).</div>
+      <div class="zone" id="zone-rows"><div class="zhead">Zeilen</div><div class="zbody"></div></div>
+      <div class="zone" id="zone-cols"><div class="zhead">Spalten</div><div class="zbody"></div></div>
+      <div class="zone" id="zone-vals"><div class="zhead">Werte</div><div class="zbody"></div></div>
+      <label><input type="checkbox" id="grandTotals" checked> Gesamtergebnis (letzte Zeile und Spalte)</label>
+      <label><input type="checkbox" id="repeatLabels"> Zeilenbeschriftungen in jeder Zeile wiederholen</label>
+      <div class="small">Gesamtergebnisse nutzen die Aggregation des jeweiligen Werts (Summe, Mittelwert …), wie in einer Excel-Pivot.</div>
+    </div>
+
     <input type="search" id="search" placeholder="Felder suchen …" oninput="applyFilter()" style="margin-top:10px">
 
     <h3>Measures <span id="cm" class="small"></span></h3>
@@ -130,7 +160,7 @@
 
     <button id="go" onclick="run()">In Tabelle schreiben</button>
     <button class="sec" onclick="clearAll()">Auswahl löschen</button>
-    <div class="small">Das Ergebnis beginnt in der aktuell markierten Zelle.</div>
+    <div id="startHint" class="small">Das Ergebnis beginnt in der aktuell markierten Zelle.</div>
 
     <h3>Werkzeuge</h3>
     <button class="sec" style="margin-top:4px" onclick="writeJoinGroups()">Kombinierbare Cubes in Tabelle schreiben</button>
@@ -140,7 +170,7 @@
   <div id="status" role="status"></div>
   <div id="build" class="small"></div>
 
-  <script src="config.js?v=cube2"></script>
-  <script src="taskpane.js?v=cube2"></script>
+  <script src="config.js?v=cube4"></script>
+  <script src="taskpane.js?v=cube4"></script>
 </body>
 </html>
