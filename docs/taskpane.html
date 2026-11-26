@@ -40,7 +40,6 @@
 
   /* Pivot-Editor */
   #pivotBox { margin-top: 8px; }
-  #pivotBox label { display: block; margin: 4px 0; }
   .zone { border: 1px dashed #9aa0a6; border-radius: 4px; padding: 4px 6px; margin: 6px 0; min-height: 34px; background: #fafafa; }
   .zone.over { border-color: #217346; background: #e6f4ea; }
   .zone .zhead { font-weight: bold; font-size: 12px; color: #3c4043; margin-bottom: 2px; }
@@ -109,13 +108,11 @@
 
     <!-- Pivot-Editor: Felder aus den Listen unten hierher ziehen -->
     <div id="pivotBox" style="display:none">
-      <div class="small">Felder aus den Listen unten in die Bereiche ziehen (oder dort anhaken). Das Add-in holt die Daten im Hintergrund, pivotiert sie selbst und schreibt nur das fertige Ergebnis ab der markierten Zelle ins Blatt (keine Rohdaten, keine Excel-PivotTable).</div>
+      <div class="small">Felder aus den Listen unten in die Bereiche ziehen (oder dort anhaken). Das Add-in holt die Daten im Hintergrund und legt an der markierten Zelle eine echte Excel-Pivot-Tabelle an. Die Rohdaten liegen auf einem ausgeblendeten Blatt.</div>
       <div class="zone" id="zone-rows"><div class="zhead">Zeilen</div><div class="zbody"></div></div>
       <div class="zone" id="zone-cols"><div class="zhead">Spalten</div><div class="zbody"></div></div>
       <div class="zone" id="zone-vals"><div class="zhead">Werte</div><div class="zbody"></div></div>
-      <label><input type="checkbox" id="grandTotals" checked> Gesamtergebnis (letzte Zeile und Spalte)</label>
-      <label><input type="checkbox" id="repeatLabels"> Zeilenbeschriftungen in jeder Zeile wiederholen</label>
-      <div class="small">Gesamtergebnisse nutzen die Aggregation des jeweiligen Werts (Summe, Mittelwert …), wie in einer Excel-Pivot.</div>
+      <div class="small">Danach kannst du die Pivot wie jede andere Excel-Pivot mit der Excel-Feldliste bearbeiten, nur mit den Feldern, die du hier gewählt hast. Markiere vorher eine freie Zelle. Ohne Namen unter „Abfrage merken“ vergibt das Add-in einen; ein gleicher Name ersetzt die bestehende Pivot. „↻ Aktualisieren“ lädt neue Daten, deine Änderungen an der Pivot bleiben erhalten.</div>
     </div>
 
     <input type="search" id="search" placeholder="Felder suchen …" oninput="applyFilter()" style="margin-top:10px">
@@ -170,7 +167,7 @@
   <div id="status" role="status"></div>
   <div id="build" class="small"></div>
 
-  <script src="config.js?v=cube4"></script>
-  <script src="taskpane.js?v=cube4"></script>
+  <script src="config.js?v=cube5"></script>
+  <script src="taskpane.js?v=cube5"></script>
 </body>
 </html>
