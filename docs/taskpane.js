@@ -4,7 +4,7 @@
 // Benötigt config.js (window.CONFIG) sowie login.html und auth-callback.html im selben Ordner.
 // Backend: Backend.gs (getMeta, runCubeQuery(query, extras)).
 
-var BUILD = "cube4";
+var BUILD = "cube5";
 var SESSION_KEY = "cube.session"; // eigener Schlüssel: alte Tokens mit anderen Berechtigungen werden nicht genutzt
 var SAVED_KEY = "cube.saved";     // Name der Einstellung in der Arbeitsmappe
 var MAX_CELLS_PER_WRITE = 20000;  // große Ergebnisse in Portionen schreiben
@@ -1070,8 +1070,9 @@ async function writeJoinGroups() {
 // =====================================================================
 // Pivot-Editor: Felder in Zeilen / Spalten / Werte ziehen, Excel baut die Pivot-Tabelle
 // =====================================================================
-// Ablauf: Cube-Abfrage wie gewohnt (flache Daten, nur im Speicher) -> das Add-in pivotiert selbst
-// -> nur das fertige Ergebnis landet im Blatt. Aktualisieren wiederholt die Abfrage und ersetzt den Bereich.
+// Ablauf: Cube-Abfrage wie gewohnt (flache Daten) -> Daten als Tabelle auf einem AUSGEBLENDETEN Blatt
+// -> echte Excel-PivotTable an der markierten Zelle (mit der Excel-Feldliste weiter bearbeitbar).
+// Aktualisieren lädt die Daten neu und frischt die Pivot auf.
 
 function zoneOf(name) {
   if (PIVOT.rows.indexOf(name) !== -1) return 'rows';
@@ -1236,13 +1237,10 @@ function onOutputChange() {
   if (piv) syncZones();
 }
 
-// ---------- Pivotieren im Hintergrund ----------
-// Es gibt weder ein Datenblatt noch eine Excel-PivotTable: Das Add-in holt die flachen Daten von Cube,
-// bildet die Kreuztabelle selbst (Zeilen x Spalten x Werte, Gesamtergebnis mit der gewählten Aggregation)
-// und schreibt nur das fertige Ergebnis ab der markierten Zelle ins Blatt.
-
-var SEP = '\u0001';   // Trenner für Schlüssel aus mehreren Dimensionen
-var SEP2 = '\u0002';
+// ---------- Echte Excel-Pivot (Quelle auf ausgeblendetem Blatt) ----------
+// Eine Excel-PivotTable braucht eine Datenquelle in der Arbeitsmappe. Das Add-in legt sie als Tabelle auf einem
+// ausgeblendeten Blatt „cd_…“ ab (Rechtsklick auf einen Blattreiter > Einblenden, falls du sie sehen willst).
+// Die Pivot selbst entsteht an der markierten Zelle und lässt sich mit der Excel-Feldliste frei bearbeiten.
 
 // d3-Format (meta.format) -> Excel-Zahlenformat (Office.js numberFormat, sprachunabhängig)
 function excelFormat(d3fmt) {
@@ -1255,201 +1253,195 @@ function excelFormat(d3fmt) {
   return f;
 }
 
-function cmpVal(a, b) {
-  var ea = (a === '' || a === null || a === undefined), eb = (b === '' || b === null || b === undefined);
-  if (ea || eb) return ea === eb ? 0 : (ea ? 1 : -1); // leere Werte ans Ende
-  if (typeof a === 'number' && typeof b === 'number') return a - b;
-  return String(a).localeCompare(String(b), 'de', { numeric: true });
+// Namen für Blatt, Tabelle und Pivot: nur Buchstaben, Ziffern, Unterstrich (plus Prüfsumme gegen Kollisionen)
+function asciiId(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 100000;
+  return s.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 20) + '_' + h;
 }
 
-function cmpParts(a, b) {
-  for (var i = 0; i < a.length; i++) {
-    var c = cmpVal(a[i], b[i]);
-    if (c) return c;
-  }
-  return 0;
-}
-
-// Beginnt auf Ebene `level` eine neue Gruppe (unterscheidet sich ein Wert bis zu dieser Ebene vom Vorgänger)?
-function groupStart(parts, prev, level) {
-  if (!prev) return true;
-  for (var k = 0; k <= level; k++) if (parts[k] !== prev[k]) return true;
-  return false;
-}
-
-function dimLabel(v) { return (v === '' || v === null || v === undefined) ? '(leer)' : v; }
-
-// Aggregation einer Liste von Zahlen (wie die Zusammenfassung in einer Excel-Pivot)
-function aggList(list, agg) {
-  var n = list.length, i, r;
-  if (!n) return '';
-  if (agg === 'count') return n;
-  if (agg === 'min') { r = list[0]; for (i = 1; i < n; i++) if (list[i] < r) r = list[i]; return r; }
-  if (agg === 'max') { r = list[0]; for (i = 1; i < n; i++) if (list[i] > r) r = list[i]; return r; }
-  r = 0;
-  for (i = 0; i < n; i++) r += list[i];
-  return agg === 'average' ? r / n : r;
-}
-
-// Spalte im Ergebnis je Feld: Neues Backend liefert keys (Feldname je Spalte), sonst Zuordnung über den Titel
-function columnIndexMap(table, query) {
-  var orig = table.values[0], map = {};
+// Spaltenköpfe eindeutig und nicht leer machen (Pivot braucht das) und die Kopfzeile je Feld zuordnen.
+function prepareHeaders(table, query) {
+  var orig = table.values[0];
+  var seen = {};
+  var header = orig.map(function (h, i) {
+    var t = (h === '' || h === null || h === undefined) ? 'Spalte ' + (i + 1) : String(h);
+    var base = t, n = 2;
+    while (seen[t]) t = base + ' (' + (n++) + ')';
+    seen[t] = true;
+    return t;
+  });
+  var fieldHeader = {};
   query.measures.concat(query.dimensions).forEach(function (m) {
+    // Neues Backend liefert keys (Feldname je Spalte); sonst Zuordnung über den Titel
     var i = table.keys ? table.keys.indexOf(m) : orig.indexOf(FIELDS[m] && FIELDS[m].title);
     if (i < 0) throw new Error('Die Spalte für „' + ((FIELDS[m] && FIELDS[m].title) || m) + '“ fehlt im Ergebnis.');
-    map[m] = i;
+    fieldHeader[m] = header[i];
   });
-  return map;
+  return { header: header, fieldHeader: fieldHeader };
 }
 
-function fieldTitle(n) { return (FIELDS[n] && FIELDS[n].title) || n; }
-
-// Baut aus den flachen Cube-Daten die Kreuztabelle.
-// pv: { rows: [Feld], cols: [Feld], vals: [{ name, agg }], totals: bool, repeat: bool }
-// Layout: Kopfzeilen (je Spaltenfeld eine Ebene, zuletzt die Kennzahlen), links die Zeilenfelder,
-// optional Gesamtergebnis als letzte Spalte und letzte Zeile.
-function buildGrid(table, query, pv) {
-  var rowDims = pv.rows, colDims = pv.cols, vals = pv.vals;
-  var R = rowDims.length, C = colDims.length, M = vals.length;
-  var idx = columnIndexMap(table, query);
-  var rowKeys = {}, colKeys = {}, cells = {}, rowTot = {}, colTot = {}, grand = [];
-  var m, i, j, k;
-  var emptyLists = function () { var a = []; for (var q = 0; q < M; q++) a.push([]); return a; };
-  for (m = 0; m < M; m++) grand.push([]);
-
-  // 1. Zeilen den Zellen zuordnen (Cube liefert je Dimensionskombination eine Zeile)
-  for (i = 1; i < table.values.length; i++) {
-    var row = table.values[i];
-    var rp = [], cp = [];
-    for (k = 0; k < R; k++) rp.push(row[idx[rowDims[k]]]);
-    for (k = 0; k < C; k++) cp.push(row[idx[colDims[k]]]);
-    var rk = rp.join(SEP), ck = cp.join(SEP);
-    if (!rowKeys[rk]) { rowKeys[rk] = rp; rowTot[rk] = emptyLists(); }
-    if (!colKeys[ck]) { colKeys[ck] = cp; colTot[ck] = emptyLists(); }
-    var cell = cells[rk + SEP2 + ck] || (cells[rk + SEP2 + ck] = emptyLists());
-    for (m = 0; m < M; m++) {
-      var v = row[idx[vals[m].name]];
-      if (typeof v === 'number') {
-        cell[m].push(v); rowTot[rk][m].push(v); colTot[ck][m].push(v); grand[m].push(v);
-      }
-    }
-  }
-
-  var rks = Object.keys(rowKeys).sort(function (a, b) { return cmpParts(rowKeys[a], rowKeys[b]); });
-  var cks = Object.keys(colKeys).sort(function (a, b) { return cmpParts(colKeys[a], colKeys[b]); });
-
-  var totCol = !!pv.totals && C > 0;
-  var totRow = !!pv.totals && R > 0;
-  var H = C > 0 ? C + 1 : 1;                        // Kopfzeilen
-  var width = R + cks.length * M + (totCol ? M : 0);
-  var nRows = H + rks.length + (totRow ? 1 : 0);
-  if (width > 16384) {
-    throw new Error('Die Pivot hätte ' + width + ' Spalten (Excel erlaubt 16.384). Verschiebe Felder von „Spalten“ nach „Zeilen“.');
-  }
-  if (nRows * width > 4000000) {
-    throw new Error('Die Pivot wäre zu groß (' + nRows + ' Zeilen × ' + width + ' Spalten). Schränke Zeitraum oder Felder ein.');
-  }
-
-  var blank = function () { var a = new Array(width); for (var q = 0; q < width; q++) a[q] = ''; return a; };
-  var mlabel = vals.map(function (v) {
-    var t = fieldTitle(v.name);
-    return v.agg === 'sum' ? t : t + ' (' + AGG_LABEL[v.agg] + ')';
+// Markierte Zelle (dort entsteht die Pivot); wird vor der Abfrage gemerkt, falls du währenddessen weiterklickst
+async function getActiveDest() {
+  return Excel.run(async function (ctx) {
+    var cell = ctx.workbook.getActiveCell();
+    cell.load(['rowIndex', 'columnIndex']);
+    var sheet = cell.worksheet;
+    sheet.load('id');
+    await ctx.sync();
+    return { sheetId: sheet.id, row: cell.rowIndex, col: cell.columnIndex };
   });
-  var fmtFor = function (v) { return v.agg === 'count' ? '#,##0' : excelFormat(FMT[v.name]); };
-
-  // 2. Kopfzeilen
-  var values = [];
-  for (j = 0; j < H; j++) values.push(blank());
-  var hdr = values[H - 1];
-  for (k = 0; k < R; k++) hdr[k] = fieldTitle(rowDims[k]);
-  if (C > 0) {
-    if (R > 0) for (k = 0; k < C; k++) values[k][R - 1] = fieldTitle(colDims[k]);
-    cks.forEach(function (ck, jj) {
-      var parts = colKeys[ck], prev = jj > 0 ? colKeys[cks[jj - 1]] : null;
-      for (var h = 0; h < C; h++) {
-        if (groupStart(parts, prev, h)) values[h][R + jj * M] = dimLabel(parts[h]);
-      }
-      for (var mm = 0; mm < M; mm++) hdr[R + jj * M + mm] = mlabel[mm];
-    });
-    if (totCol) {
-      values[0][R + cks.length * M] = 'Gesamtergebnis';
-      for (m = 0; m < M; m++) hdr[R + cks.length * M + m] = mlabel[m];
-    }
-  } else {
-    for (m = 0; m < M; m++) hdr[R + m] = mlabel[m];
-  }
-
-  // Zahlenformat je Spalte
-  var formats = [];
-  for (k = 0; k < R; k++) formats.push(null);
-  for (j = 0; j < cks.length + (totCol ? 1 : 0); j++) vals.forEach(function (v) { formats.push(fmtFor(v)); });
-
-  // 3. Datenzeilen
-  rks.forEach(function (rk, ii) {
-    var parts = rowKeys[rk], prev = ii > 0 ? rowKeys[rks[ii - 1]] : null;
-    var out = blank();
-    for (var kk = 0; kk < R; kk++) {
-      out[kk] = (pv.repeat || groupStart(parts, prev, kk)) ? dimLabel(parts[kk]) : '';
-    }
-    cks.forEach(function (ck, jj) {
-      var cell = cells[rk + SEP2 + ck];
-      for (var mm = 0; mm < M; mm++) out[R + jj * M + mm] = cell ? aggList(cell[mm], vals[mm].agg) : '';
-    });
-    if (totCol) for (var m2 = 0; m2 < M; m2++) out[R + cks.length * M + m2] = aggList(rowTot[rk][m2], vals[m2].agg);
-    values.push(out);
-  });
-
-  // 4. Gesamtergebnis (Zeile)
-  if (totRow) {
-    var t = blank();
-    t[0] = 'Gesamtergebnis';
-    cks.forEach(function (ck, jj) {
-      for (var mm = 0; mm < M; mm++) t[R + jj * M + mm] = aggList(colTot[ck][mm], vals[mm].agg);
-    });
-    if (totCol) for (m = 0; m < M; m++) t[R + cks.length * M + m] = aggList(grand[m], vals[m].agg);
-    values.push(t);
-  }
-
-  return { values: values, headerRows: H, width: width, rows: values.length, M: M, totRow: totRow, totCol: totCol, formats: formats };
 }
 
-// Kopfzeilen und Gesamtergebnis fett, Linie unter der Kopfzeile (nur Komfort: Fehler hier brechen nichts ab)
-async function styleGrid(t, grid) {
+async function dropSheet(id) {
   try {
     await Excel.run(async function (ctx) {
-      var sheet = ctx.workbook.worksheets.getItem(t.sheetId);
-      var head = sheet.getRangeByIndexes(t.row, t.col, grid.headerRows, grid.width);
-      head.format.font.bold = true;
-      head.format.borders.getItem('EdgeBottom').style = 'Continuous';
-      if (grid.totRow) {
-        var tr = sheet.getRangeByIndexes(t.row + grid.rows - 1, t.col, 1, grid.width);
-        tr.format.font.bold = true;
-        tr.format.borders.getItem('EdgeTop').style = 'Continuous';
-      }
-      if (grid.totCol) {
-        sheet.getRangeByIndexes(t.row, t.col + grid.width - grid.M, grid.rows, grid.M).format.font.bold = true;
-      }
-      // Spaltenbreite nur an den ersten Zeilen ausrichten (schnell, auch bei vielen Zeilen)
-      sheet.getRangeByIndexes(t.row, t.col, Math.min(grid.rows, 200), grid.width).format.autofitColumns();
+      var sh = ctx.workbook.worksheets.getItemOrNullObject(id);
       await ctx.sync();
+      if (!sh.isNullObject) { sh.delete(); await ctx.sync(); }
     });
-  } catch (e) { console.warn('Formatierung der Pivot nicht möglich:', e); }
+  } catch (e) { /* Aufräumen ist optional */ }
 }
 
-// „Aktualisieren“ für eine gespeicherte Pivot: gleiche Abfrage, gleiche Belegung, gleiche Stelle.
-// Erst abfragen und die Kreuztabelle bauen, dann den alten Bereich leeren: bei einem Fehler bleibt alles stehen.
+// Schreibt die Daten auf das ausgeblendete Blatt und legt an dest die Pivot an.
+// Eine bestehende Pivot mit demselben Namen (base) wird ersetzt. Liefert die Beschreibung für „Aktualisieren“.
+async function buildPivot(table, query, spec, base, dest) {
+  var prep = prepareHeaders(table, query);
+  var values = table.values.slice();
+  values[0] = prep.header;
+  var rows = values.length, cols = values[0].length;
+
+  var id = asciiId(base);
+  var dataName = 'cd_' + id, tblName = 'tbl_' + id, ptName = 'pt_' + id;
+
+  // 1. alte Pivot gleichen Namens entfernen (egal auf welchem Blatt), verstecktes Datenblatt anlegen bzw. leeren
+  var dsId = await Excel.run(async function (ctx) {
+    var wb = ctx.workbook;
+    wb.worksheets.load('items');
+    await ctx.sync();
+    var sheets = wb.worksheets.items;
+    sheets.forEach(function (ws) { ws.pivotTables.load('items'); });
+    await ctx.sync();
+    sheets.forEach(function (ws) {
+      ws.pivotTables.items.forEach(function (p) { if (p.name === ptName) p.delete(); });
+    });
+    await ctx.sync();
+
+    var ds = wb.worksheets.getItemOrNullObject(dataName);
+    await ctx.sync();
+    if (ds.isNullObject) {
+      ds = wb.worksheets.add(dataName);
+    } else {
+      ds.tables.load('items');
+      await ctx.sync();
+      ds.tables.items.forEach(function (t) { t.delete(); });
+      ds.getRange().clear();
+      await ctx.sync();
+    }
+    ds.visibility = 'Hidden';
+    ds.load('id');
+    await ctx.sync();
+    return ds.id;
+  });
+
+  // 2. Rohdaten schreiben (auf dem ausgeblendeten Blatt)
+  await writeTable(values, { sheetId: dsId, row: 0, col: 0 });
+
+  // 3. Tabelle als Quelle + Pivot an der markierten Zelle
+  try {
+    await Excel.run(async function (ctx) {
+      var wb = ctx.workbook;
+      var ds = wb.worksheets.getItem(dsId), ps = wb.worksheets.getItem(dest.sheetId);
+      var tbl = ds.tables.add(ds.getRangeByIndexes(0, 0, rows, cols), true);
+      tbl.name = tblName;
+
+      var pt = ps.pivotTables.add(ptName, tbl, ps.getRangeByIndexes(dest.row, dest.col, 1, 1));
+      spec.rows.forEach(function (n) { pt.rowHierarchies.add(pt.hierarchies.getItem(prep.fieldHeader[n])); });
+      spec.cols.forEach(function (n) { pt.columnHierarchies.add(pt.hierarchies.getItem(prep.fieldHeader[n])); });
+      spec.vals.forEach(function (v) {
+        var dh = pt.dataHierarchies.add(pt.hierarchies.getItem(prep.fieldHeader[v.name]));
+        dh.summarizeBy = AGG[v.agg] || 'Sum';
+        var nf = v.agg === 'count' ? '#,##0' : excelFormat(FMT[v.name]);
+        if (nf) dh.numberFormat = nf;
+      });
+      ps.activate();
+      await ctx.sync();
+    });
+  } catch (e) {
+    await dropSheet(dsId);
+    throw new Error('Die Pivot-Tabelle konnte an der markierten Zelle nicht angelegt werden. ' +
+      'Markiere eine freie Zelle (am besten auf einem leeren Blatt), die keine andere Pivot-Tabelle berührt. (' + e.message + ')');
+  }
+
+  // Tabellarisches Layout ist nur Komfort: schlägt es fehl, bleibt die Pivot trotzdem bestehen
+  try {
+    await Excel.run(async function (ctx) {
+      var p = ctx.workbook.worksheets.getItem(dest.sheetId).pivotTables.getItem(ptName);
+      p.layout.layoutType = 'Tabular';
+      await ctx.sync();
+    });
+  } catch (e) { /* ignorieren */ }
+
+  return {
+    version: 3,
+    base: base,
+    dataSheetId: dsId,
+    pivotSheetId: dest.sheetId,
+    pivotRow: dest.row,
+    pivotCol: dest.col,
+    tableName: tblName,
+    pivotName: ptName,
+    dataRows: rows,
+    header: prep.header,
+    spec: spec
+  };
+}
+
+// Neue Daten in die vorhandene Tabelle schreiben und die Pivot aktualisieren.
+// Dabei bleibt alles erhalten, was du in Excel an der Pivot geändert hast (Felder, Filter, Formatierung).
+// Braucht ExcelApi 1.13 (Tabelle vergrößern/verkleinern). Liefert false, wenn das nicht geht.
+async function updatePivotInPlace(q, table) {
+  if (!Office.context.requirements.isSetSupported('ExcelApi', '1.13')) return false;
+  var pv = q.pivot;
+  var prep = prepareHeaders(table, q.query);
+  if (JSON.stringify(prep.header) !== JSON.stringify(pv.header)) return false; // Struktur hat sich geändert
+
+  var values = table.values.slice();
+  values[0] = prep.header;
+  var rows = values.length, cols = values[0].length;
+
+  await writeTable(values, { sheetId: pv.dataSheetId, row: 0, col: 0 });
+  await Excel.run(async function (ctx) {
+    var ds = ctx.workbook.worksheets.getItem(pv.dataSheetId);
+    var ps = ctx.workbook.worksheets.getItem(pv.pivotSheetId);
+    if (pv.dataRows > rows) ds.getRangeByIndexes(rows, 0, pv.dataRows - rows, cols).clear('Contents');
+    ds.tables.getItem(pv.tableName).resize(ds.getRangeByIndexes(0, 0, rows, cols));
+    ps.pivotTables.getItem(pv.pivotName).refresh();
+    await ctx.sync();
+  });
+  pv.dataRows = rows;
+  return true;
+}
+
+// „Aktualisieren“ für eine gespeicherte Pivot: gleiche Abfrage, neue Daten.
 async function refreshPivot(q) {
-  if (!q.pivot || q.pivot.version !== 2) {
+  var pv = q.pivot;
+  if (!pv || pv.version !== 3) {
     throw new Error('Diese gespeicherte Pivot stammt aus einer älteren Version des Add-ins. Bitte neu erstellen.');
   }
   var table = await fetchTable(q.query, q.formats);
   if (!table) return 'Keine Daten';
-  var grid = buildGrid(table, q.query, q.pivot);
-  await clearArea(q, true);
-  var t = await writeTable(grid.values, q, grid.formats, grid.headerRows);
-  await styleGrid(t, grid);
-  q.rows = t.rows; q.cols = t.cols;
-  var msg = (table.values.length - 1) + ' Datenzeilen pivotiert · Pivot aktualisiert';
+  var inPlace = false;
+  try {
+    inPlace = await updatePivotInPlace(q, table);
+  } catch (e) {
+    console.warn('Pivot konnte nicht direkt aktualisiert werden, baue sie neu auf:', e);
+  }
+  if (!inPlace) {
+    // Fallback: Pivot an gleicher Stelle neu aufbauen (Änderungen in Excel gehen dabei verloren)
+    q.pivot = await buildPivot(table, q.query, pv.spec, pv.base, { sheetId: pv.pivotSheetId, row: pv.pivotRow, col: pv.pivotCol });
+  }
+  var msg = (table.values.length - 1) + ' Datenzeilen · Pivot ' + (inPlace ? 'aktualisiert' : 'neu aufgebaut');
   if (table.warn) msg += '\n⚠ Die Pivot beruht auf unvollständigen Daten, die Summen stimmen nicht.\n' + table.warn;
   return msg;
 }
@@ -1459,30 +1451,28 @@ async function runPivot(query, name, formats) {
     setStatus('Zieh mindestens eine Kennzahl nach „Werte“ und ein Feld nach „Zeilen“ oder „Spalten“.', true);
     return;
   }
-  var pv = {
-    version: 2,
+  // Pivots werden immer gespeichert, damit „Aktualisieren“ sie später mit neuen Cube-Daten versorgen kann
+  var auto = !name;
+  if (auto) name = 'Pivot ' + new Date().toLocaleString('de-DE');
+  var spec = {
     rows: PIVOT.rows.slice(),
     cols: PIVOT.cols.slice(),
-    vals: PIVOT.vals.map(function (v) { return { name: v.name, agg: v.agg }; }),
-    totals: $('grandTotals').checked,
-    repeat: $('repeatLabels').checked
+    vals: PIVOT.vals.map(function (v) { return { name: v.name, agg: v.agg }; })
   };
+
+  var dest;
+  try { dest = await getActiveDest(); } catch (e) { setStatus(e.message, true); return; }
 
   var ok = await withBusy('Abfrage läuft …', async function () {
     var table = await fetchTable(query, formats);
-    if (!table) return 'Keine Daten' + (name ? ' (nicht gespeichert)' : '');
-    var grid = buildGrid(table, query, pv);
-    var t = await writeTable(grid.values, null, grid.formats, grid.headerRows);
-    await styleGrid(t, grid);
-    var msg = (table.values.length - 1) + ' Datenzeilen pivotiert · ' + (grid.rows - grid.headerRows) + ' Zeilen × ' + grid.width + ' Spalten geschrieben';
-    if (name) {
-      await saveQuery(name, query, t, formats, pv);
-      msg += ' · als „' + name + '“ gespeichert';
-    }
+    if (!table) return 'Keine Daten';
+    var meta = await buildPivot(table, query, spec, name, dest);
+    await saveQuery(name, query, { sheetId: dest.sheetId, row: dest.row, col: dest.col, rows: 0, cols: 0 }, formats, meta);
+    var msg = (table.values.length - 1) + ' Datenzeilen · Pivot „' + name + '“ angelegt' + (auto ? ' (Name automatisch vergeben)' : '') + '.';
     if (table.warn) msg += '\n⚠ Die Pivot beruht auf unvollständigen Daten, die Summen stimmen nicht.\n' + table.warn;
     return msg;
   });
-  if (ok && name) await loadSaved();
+  if (ok) await loadSaved();
 }
 
 // =====================================================================
@@ -1496,6 +1486,11 @@ Office.onReady(function () {
   $('measures').addEventListener('change', onFieldToggle);
   $('dimensions').addEventListener('change', onFieldToggle);
   initZones();
+  // Excel-Pivot-Tabellen brauchen ExcelApi 1.8
+  if (!Office.context.requirements.isSetSupported('ExcelApi', '1.8')) {
+    var po = $('output').querySelector('option[value="pivot"]');
+    if (po) po.remove();
+  }
 
   $('login').disabled = false;
   renderAuth();
