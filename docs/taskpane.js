@@ -1,1074 +1,176 @@
-// Excel-Add-in "Cube": gleiche Funktionen wie das Google-Sheets-Add-on.
-// Ablauf: Google-Login (Dialog) -> Apps Script API (scripts.run) -> Backend holt Daten von Cube
-// -> Ergebnis wird mit Office.js in die Tabelle geschrieben.
-// Benötigt config.js (window.CONFIG) sowie login.html und auth-callback.html im selben Ordner.
-// Backend: Backend.gs (getMeta, runCubeQuery(query, extras)).
-
-var BUILD = "cube2";
-var SESSION_KEY = "cube.session"; // eigener Schlüssel: alte Tokens mit anderen Berechtigungen werden nicht genutzt
-var SAVED_KEY = "cube.saved";     // Name der Einstellung in der Arbeitsmappe
-var MAX_CELLS_PER_WRITE = 20000;  // große Ergebnisse in Portionen schreiben
-
-var MAX_LIMIT = 50000;     // Höchstwert der Instanz
-var PRESET_LIMIT = 50000;  // Vorlagen werden vollständig geladen
-
-var META = [];             // alle Cubes und Views aus /meta
-var VIEWS = [];            // nur Views mit meta.case (Case-Modus)
-var CUR = null;            // im Case-Modus gewählte View
-var MODE = 'case';         // 'case' oder 'dev'
-var DIMS = {};             // Dimension-Name -> { title, short, type }
-var FMT = {};              // Measure-Name -> d3-Format (meta.format)
-var PRESET_FILTERS = [];   // Filter der geladenen Vorlage (unverändert weitergereicht)
-var started = false;
-
-// Operatoren je Datentyp (Cube-Filteroperatoren)
-var OPS = {
-  string: [
-    ['equals', 'ist gleich'], ['notEquals', 'ist nicht gleich'],
-    ['contains', 'enthält'], ['notContains', 'enthält nicht'],
-    ['startsWith', 'beginnt mit'], ['endsWith', 'endet mit'],
-    ['set', 'ist gesetzt'], ['notSet', 'ist leer']
-  ],
-  number: [
-    ['equals', '='], ['notEquals', '≠'],
-    ['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'],
-    ['set', 'ist gesetzt'], ['notSet', 'ist leer']
-  ],
-  boolean: [
-    ['equals', 'ist'], ['notEquals', 'ist nicht'],
-    ['set', 'ist gesetzt'], ['notSet', 'ist leer']
-  ]
-};
-
-function $(id) { return document.getElementById(id); }
-
-function setStatus(msg, isErr) {
-  var s = $('status');
-  msg = msg || '';
-  s.textContent = msg;
-  s.className = isErr ? 'err' : (msg.indexOf('⚠') !== -1 ? 'warn' : '');
-}
-
-function setBusy(busy) {
-  Array.prototype.forEach.call(document.querySelectorAll('button'), function (b) { b.disabled = busy; });
-  if (!busy) fillPresetsState();
-}
-
-// =====================================================================
-// Anmeldung (Token im localStorage der Seitenleiste)
-// =====================================================================
-
-function clearSession() {
-  try { localStorage.removeItem(SESSION_KEY); } catch (e) { /* ignorieren */ }
-}
-
-// Liefert { token, email, exp } oder null, wenn nicht angemeldet / Token abgelaufen.
-function getSession() {
-  try {
-    var s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
-    if (!s || !s.token || s.exp < Date.now() + 30000) { clearSession(); return null; }
-    return s;
-  } catch (e) {
-    clearSession();
-    return null;
-  }
-}
-
-function renderAuth() {
-  var s = getSession();
-  $('loggedOut').hidden = !!s;
-  $('app').hidden = !s;
-  if (s) $('user').textContent = 'Angemeldet' + (s.email ? ' als ' + s.email : '');
-}
-
-function login() {
-  return new Promise(function (resolve, reject) {
-    var state = crypto.randomUUID();
-    var url = new URL('login.html', location.href);
-    url.searchParams.set('state', state);
-
-    Office.context.ui.displayDialogAsync(url.href, { height: 60, width: 30 }, function (res) {
-      if (res.status !== Office.AsyncResultStatus.Succeeded) {
-        return reject(new Error('Dialog konnte nicht geöffnet werden: ' + res.error.message));
-      }
-      var dialog = res.value;
-
-      dialog.addEventHandler(Office.EventType.DialogMessageReceived, async function (arg) {
-        dialog.close();
-        try {
-          var msg = JSON.parse(arg.message);
-          if (msg.error || !msg.accessToken) throw new Error(msg.error || 'Kein Token erhalten');
-          if (msg.state !== state) throw new Error('State stimmt nicht überein');
-
-          // E-Mail nur für die Anzeige abfragen
-          var email = '';
-          try {
-            var r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-              headers: { Authorization: 'Bearer ' + msg.accessToken }
-            });
-            email = (await r.json()).email || '';
-          } catch (e) { /* nur Anzeige, kein Abbruch */ }
-
-          localStorage.setItem(SESSION_KEY, JSON.stringify({
-            token: msg.accessToken,
-            email: email,
-            exp: Date.now() + msg.expiresIn * 1000
-          }));
-          resolve(getSession());
-        } catch (e) {
-          reject(e);
-        }
-      });
-
-      // Nutzer hat das Fenster selbst geschlossen
-      dialog.addEventHandler(Office.EventType.DialogEventReceived, function () {
-        reject(new Error('Anmeldung abgebrochen'));
-      });
-    });
-  });
-}
-
-// =====================================================================
-// Backend aufrufen (Apps Script API, scripts.run)
-// =====================================================================
-
-function explainHttpError(status, data) {
-  var apiMsg = data && data.error && data.error.message ? ' (' + data.error.message + ')' : '';
-  if (status === 404) {
-    return 'Skript nicht gefunden' + apiMsg + '. Prüfe: Deployment-ID in config.js, Typ „API-Ausführbare Datei“, ' +
-      'und ob das Backend-Projekt mit demselben Google-Cloud-Projekt wie die OAuth-Client-ID verknüpft ist.';
-  }
-  if (status === 403) {
-    return 'Zugriff verweigert' + apiMsg + '. Prüfe: Apps Script API im Cloud-Projekt aktiviert? ' +
-      'Darf dein Konto die Bereitstellung nutzen (Wer hat Zugriff)? Wurde beim Login alles erlaubt?';
-  }
-  return 'HTTP ' + status + apiMsg;
-}
-
-async function runScript(functionName, parameters, retry) {
-  if (retry === undefined) retry = true;
-  var session = getSession() || (await login());
-  renderAuth();
-
-  var res = await fetch(
-    'https://script.googleapis.com/v1/scripts/' + encodeURIComponent(CONFIG.DEPLOYMENT_ID) + ':run',
-    {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + session.token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ function: functionName, parameters: parameters || [] })
-    }
-  );
-
-  var data = {};
-  try { data = await res.json(); } catch (e) { /* keine JSON-Antwort */ }
-
-  if (res.status === 401 && retry) {
-    clearSession();
-    await login();
-    renderAuth();
-    return runScript(functionName, parameters, false);
-  }
-  if (!res.ok) throw new Error(explainHttpError(res.status, data));
-
-  // HTTP 200, aber das Skript hat einen Fehler geworfen (z. B. "Kein Zugriff auf Cube (403)")
-  if (data.error) {
-    var detail = data.error.details && data.error.details[0];
-    throw new Error((detail && detail.errorMessage) || data.error.message || 'Skriptfehler');
-  }
-  return data.response ? data.response.result : undefined;
-}
-
-// Abfrage ausführen: liefert { values, formats, warn } oder null (keine Daten).
-// formats: { 'view.measure': d3-Format } -> das Backend liefert daraus das Excel-Zahlenformat je Spalte.
-// Ein älteres Backend (nur { values }) funktioniert weiter, dann ohne Formate und ohne Limit-Hinweis.
-async function fetchTable(query, formats) {
-  var res = await runScript('runCubeQuery', [query, { formats: formats || {} }]);
-  if (!res || !res.values || !res.values.length) return null;
-  return { values: res.values, formats: res.formats || [], warn: res.warn || '' };
-}
-
-// =====================================================================
-// In die Tabelle schreiben (Office.js)
-// =====================================================================
-
-// Texte, die mit = + - @ beginnen, würde Excel als Formel auslesen: als Text kennzeichnen
-function escapeCell(v) {
-  if (typeof v === 'string' && /^[=+\-@]/.test(v)) return "'" + v;
-  return v;
-}
-
-async function sheetExists(sheetId) {
-  return Excel.run(async function (ctx) {
-    var sheet = ctx.workbook.worksheets.getItemOrNullObject(sheetId);
-    await ctx.sync();
-    return !sheet.isNullObject;
-  });
-}
-
-// Zahlenformat je Spalte setzen (nur Datenzeilen, nicht die Kopfzeile)
-async function applyFormats(ctx, sheet, row, col, rows, formats) {
-  if (!formats || rows < 2) return;
-  for (var c = 0; c < formats.length; c++) {
-    if (!formats[c]) continue;
-    for (var i = 1; i < rows; i += MAX_CELLS_PER_WRITE) {
-      var n = Math.min(MAX_CELLS_PER_WRITE, rows - i);
-      var fmt = [];
-      for (var k = 0; k < n; k++) fmt.push([formats[c]]);
-      sheet.getRangeByIndexes(row + i, col + c, n, 1).numberFormat = fmt;
-      await ctx.sync();
-    }
-  }
-}
-
-// Ohne target: ab der aktiven Zelle. Mit target ({ sheetId, row, col }, 0-basiert): an dieser Position.
-// formats (optional): Excel-Zahlenformat je Spalte oder null.
-// Liefert die geschriebene Position und Größe zurück.
-async function writeTable(values, target, formats) {
-  return Excel.run(async function (ctx) {
-    var sheet, row, col, sheetId;
-    if (target) {
-      sheet = ctx.workbook.worksheets.getItemOrNullObject(target.sheetId);
-      await ctx.sync();
-      if (sheet.isNullObject) throw new Error('Das Zielblatt existiert nicht mehr.');
-      row = target.row; col = target.col; sheetId = target.sheetId;
-    } else {
-      var cell = ctx.workbook.getActiveCell();
-      cell.load(['rowIndex', 'columnIndex']);
-      sheet = cell.worksheet;
-      sheet.load('id');
-      await ctx.sync();
-      row = cell.rowIndex; col = cell.columnIndex; sheetId = sheet.id;
-    }
-
-    var rows = values.length, cols = values[0].length;
-    if (row + rows > 1048576 || col + cols > 16384) {
-      throw new Error('Das Ergebnis passt ab dieser Zelle nicht mehr ins Tabellenblatt.');
-    }
-
-    var chunk = Math.max(1, Math.floor(MAX_CELLS_PER_WRITE / cols));
-    for (var i = 0; i < rows; i += chunk) {
-      var part = values.slice(i, i + chunk).map(function (r) { return r.map(escapeCell); });
-      sheet.getRangeByIndexes(row + i, col, part.length, cols).values = part;
-      await ctx.sync();
-    }
-    await applyFormats(ctx, sheet, row, col, rows, formats);
-    return { sheetId: sheetId, row: row, col: col, rows: rows, cols: cols };
-  });
-}
-
-// Alten Ergebnisbereich leeren (nur Inhalte, Formatierung bleibt)
-async function clearArea(q) {
-  if (!q.rows || !q.cols) return;
-  await Excel.run(async function (ctx) {
-    var sheet = ctx.workbook.worksheets.getItemOrNullObject(q.sheetId);
-    await ctx.sync();
-    if (sheet.isNullObject) throw new Error('Das Zielblatt existiert nicht mehr.');
-    sheet.getRangeByIndexes(q.row, q.col, q.rows, q.cols).clear('Contents');
-    await ctx.sync();
-  });
-}
-
-// =====================================================================
-// Gespeicherte Abfragen (liegen in den Einstellungen der Arbeitsmappe)
-// =====================================================================
-
-async function loadSavedList() {
-  var list = [];
-  await Excel.run(async function (ctx) {
-    var item = ctx.workbook.settings.getItemOrNullObject(SAVED_KEY);
-    item.load('value');
-    await ctx.sync();
-    if (!item.isNullObject) {
-      try { list = JSON.parse(item.value) || []; } catch (e) { list = []; }
-    }
-  });
-  list.sort(function (a, b) { return a.name.localeCompare(b.name); });
-  return list;
-}
-
-async function storeSavedList(list) {
-  await Excel.run(async function (ctx) {
-    ctx.workbook.settings.add(SAVED_KEY, JSON.stringify(list));
-    await ctx.sync();
-  });
-}
-
-async function saveQuery(name, query, target, formats) {
-  var list = await loadSavedList();
-  var existing = list.filter(function (q) { return q.name === name; })[0];
-  var entry = {
-    id: existing ? existing.id : crypto.randomUUID(),
-    name: name,
-    query: query,
-    formats: formats || {},
-    sheetId: target.sheetId,
-    row: target.row,
-    col: target.col,
-    rows: target.rows,
-    cols: target.cols,
-    lastRun: new Date().toISOString()
-  };
-  list = list.filter(function (q) { return q.name !== name; }).concat([entry]);
-  await storeSavedList(list);
-}
-
-function summary(query) {
-  var n = function (a) { return (a || []).length; };
-  var parts = [n(query.measures) + ' Measures', n(query.dimensions) + ' Dimensions'];
-  if (n(query.filters)) parts.push(n(query.filters) + ' Filter');
-  if (n(query.timeDimensions)) parts.push('Zeitraum');
-  return parts.join(' · ');
-}
-
-// Liste für die Anzeige (mit Position wie "Tabelle1!B2")
-async function getSavedQueries() {
-  var list = await loadSavedList();
-  var out = list.map(function (q) {
-    return { id: q.id, name: q.name, where: 'Blatt nicht gefunden', lastRun: q.lastRun, summary: summary(q.query) };
-  });
-  await Excel.run(async function (ctx) {
-    var sheets = list.map(function (q) { return ctx.workbook.worksheets.getItemOrNullObject(q.sheetId); });
-    await ctx.sync();
-    var ranges = list.map(function (q, i) {
-      if (sheets[i].isNullObject) return null;
-      var r = sheets[i].getRangeByIndexes(q.row, q.col, 1, 1);
-      r.load('address');
-      return r;
-    });
-    await ctx.sync();
-    ranges.forEach(function (r, i) { if (r) out[i].where = r.address; });
-  });
-  return out;
-}
-
-async function deleteSavedQuery(id) {
-  var list = await loadSavedList();
-  await storeSavedList(list.filter(function (q) { return q.id !== id; }));
-}
-
-// Holt frische Daten und schreibt sie mit derselben Abfrage an die gespeicherte Position.
-// Erst abfragen, dann den alten Bereich leeren: bei einem Fehler bleiben die alten Daten stehen.
-async function refreshSaved(q) {
-  if (!(await sheetExists(q.sheetId))) throw new Error('Das Zielblatt existiert nicht mehr.');
-  var table = await fetchTable(q.query, q.formats);
-  await clearArea(q);
-
-  var msg;
-  if (!table) {
-    q.rows = 0; q.cols = 0;
-    msg = 'Keine Daten';
-  } else {
-    var t = await writeTable(table.values, q, table.formats);
-    q.rows = t.rows; q.cols = t.cols;
-    msg = (table.values.length - 1) + ' Zeilen aktualisiert';
-    if (table.warn) msg += '\n' + table.warn;
-  }
-  q.lastRun = new Date().toISOString();
-  return msg;
-}
-
-// =====================================================================
-// Gespeicherte Abfragen: Anzeige und Aktionen
-// =====================================================================
-
-async function loadSaved() {
-  try {
-    renderSaved(await getSavedQueries());
-  } catch (e) {
-    setStatus(e.message, true);
-  }
-}
-
-function formatTime(iso) {
-  var d = new Date(iso);
-  return isNaN(d.getTime()) ? '' : d.toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' });
-}
-
-function renderSaved(list) {
-  var box = $('saved');
-  box.textContent = '';
-  $('savedEmpty').style.display = list.length ? 'none' : '';
-  $('refreshAll').style.display = list.length > 1 ? '' : 'none';
-
-  list.forEach(function (q) {
-    var row = document.createElement('div');
-    row.className = 'srow';
-
-    var info = document.createElement('div');
-    info.className = 'sinfo';
-    var name = document.createElement('div');
-    name.className = 'sname';
-    name.textContent = q.name;
-    name.title = q.name;
-    var meta = document.createElement('div');
-    meta.className = 'small';
-    meta.textContent = q.where + ' · ' + q.summary;
-    var last = document.createElement('div');
-    last.className = 'small';
-    last.textContent = q.lastRun ? 'Zuletzt: ' + formatTime(q.lastRun) : '';
-    info.appendChild(name); info.appendChild(meta); info.appendChild(last);
-
-    var rb = document.createElement('button');
-    rb.textContent = '↻ Aktualisieren';
-    rb.title = 'Frische Daten holen und an die gespeicherte Stelle schreiben';
-    rb.onclick = function () { refreshOne(q.id); };
-
-    var db = document.createElement('button');
-    db.className = 'sec';
-    db.textContent = '✕';
-    db.title = 'Gespeicherte Abfrage löschen (die Daten in der Tabelle bleiben)';
-    var armed = false, timer = null;
-    db.onclick = function () {
-      if (!armed) {
-        armed = true;
-        db.textContent = 'Löschen?';
-        timer = setTimeout(function () { armed = false; db.textContent = '✕'; }, 3000);
-        return;
-      }
-      clearTimeout(timer);
-      removeOne(q.id);
-    };
-
-    row.appendChild(info); row.appendChild(rb); row.appendChild(db);
-    box.appendChild(row);
-  });
-}
-
-// Führt eine Aktion mit Statusanzeige aus und sperrt währenddessen die Buttons
-async function withBusy(startMsg, fn) {
-  setBusy(true);
-  setStatus(startMsg || '');
-  try {
-    var msg = await fn();
-    setStatus(msg || '', /Fehler bei/.test(msg || ''));
-    return true;
-  } catch (e) {
-    console.error(e);
-    setStatus(e.message, true);
-    return false;
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function refreshOne(id) {
-  await withBusy('Aktualisiere …', async function () {
-    var list = await loadSavedList();
-    var q = list.filter(function (x) { return x.id === id; })[0];
-    if (!q) throw new Error('Gespeicherte Abfrage nicht gefunden.');
-    var msg = '„' + q.name + '“: ' + (await refreshSaved(q));
-    await storeSavedList(list);
-    return msg;
-  });
-  await loadSaved();
-}
-
-// Aktualisiert alle gespeicherten Abfragen; ein Fehler stoppt die übrigen nicht.
-async function refreshAll() {
-  await withBusy('Aktualisiere alle …', async function () {
-    var list = await loadSavedList();
-    if (!list.length) return 'Keine gespeicherten Abfragen vorhanden.';
-    var ok = 0, failed = [], truncated = [];
-    for (var i = 0; i < list.length; i++) {
-      try {
-        var r = await refreshSaved(list[i]);
-        ok++;
-        if (r.indexOf('⚠') !== -1) truncated.push('„' + list[i].name + '“');
-      } catch (e) {
-        failed.push('„' + list[i].name + '“ (' + e.message + ')');
-      }
-    }
-    await storeSavedList(list);
-    var msg = ok + ' von ' + list.length + ' Abfragen aktualisiert';
-    if (truncated.length) msg += '. ⚠ Zeilenlimit erreicht bei: ' + truncated.join('; ');
-    if (failed.length) msg += '. Fehler bei: ' + failed.join('; ');
-    return msg;
-  });
-  await loadSaved();
-}
-
-async function removeOne(id) {
-  await withBusy('', async function () { await deleteSavedQuery(id); return ''; });
-  await loadSaved();
-}
-
-// =====================================================================
-// Start der Oberfläche: Cube-Modell laden
-// =====================================================================
-
-async function startApp() {
-  if (started) return;
-  started = true;
-  setStatus('Lade Cube-Modell …');
-  loadSaved();
-  try {
-    init((await runScript('getMeta')) || []);
-  } catch (e) {
-    started = false; // beim nächsten Versuch neu laden
-    setStatus(e.message, true);
-  }
-}
-
-function init(meta) {
-  META = meta;
-  DIMS = {}; FMT = {};
-  META.forEach(function (c) {
-    c.dimensions.forEach(function (d) {
-      DIMS[d.name] = { title: c.title + ' › ' + d.title, short: d.title, type: d.type };
-    });
-    c.measures.forEach(function (m) { if (m.format) FMT[m.name] = m.format; });
-  });
-  // Case-Modus zeigt nur Views mit meta.case
-  VIEWS = META.filter(function (c) { return c.type === 'view' && c.caseName; });
-  fillViewSelect();
-  onModeChange();
-}
-
-// Anzeigename einer Dimension: im Case-Modus der Kurztitel, sonst mit Cube-Namen davor
-function dimTitle(n) {
-  var d = DIMS[n];
-  return !d ? n : (MODE === 'case' ? d.short : d.title);
-}
-
-// =====================================================================
-// Modus, Auswertung (View) und Vorlagen
-// =====================================================================
-
-// Auswahl: erste Ebene = meta.case (nach case_order), zweite Ebene = meta.view_label (nach view_order)
-function fillViewSelect() {
-  var sel = $('viewSel');
-  sel.textContent = '';
-  if (!VIEWS.length) {
-    var none = document.createElement('option');
-    none.value = ''; none.textContent = '– keine Views mit meta.case –';
-    sel.appendChild(none);
-    return;
-  }
-  var cases = {};
-  VIEWS.forEach(function (v) { (cases[v.caseName] = cases[v.caseName] || []).push(v); });
-  var minOrder = function (name) {
-    return Math.min.apply(null, cases[name].map(function (v) { return v.caseOrder; }));
-  };
-  Object.keys(cases)
-    .sort(function (a, b) { return minOrder(a) - minOrder(b) || a.localeCompare(b); })
-    .forEach(function (name) {
-      var g = document.createElement('optgroup');
-      g.label = name;
-      cases[name]
-        .sort(function (a, b) { return a.viewOrder - b.viewOrder || a.viewLabel.localeCompare(b.viewLabel); })
-        .forEach(function (v) {
-          var o = document.createElement('option');
-          o.value = v.name; o.textContent = v.viewLabel;
-          g.appendChild(o);
-        });
-      sel.appendChild(g);
-    });
-}
-
-function currentView() {
-  var name = $('viewSel').value;
-  return VIEWS.filter(function (v) { return v.name === name; })[0] || null;
-}
-
-function onModeChange() {
-  MODE = $('mode').value;
-  var dev = MODE === 'dev';
-  $('caseBox').style.display = dev ? 'none' : '';
-  $('devHint').style.display = dev ? '' : 'none';
-  $('granBox').style.display = dev ? '' : 'none';
-  CUR = dev ? null : currentView();
-  renderLists();
-  resetForm();
-  fillPresets();
-  if (!dev && !VIEWS.length) {
-    setStatus('Im Modell wurden keine Views mit meta.case gefunden. Über „Alle Cubes und Views“ stehen alle Felder zur Verfügung.', true);
-  }
-}
-
-function onViewChange() {
-  CUR = currentView();
-  renderLists();
-  resetForm();
-  fillPresets();
-}
-
-function fillPresets() {
-  var sel = $('preset');
-  sel.textContent = '';
-  var list = (MODE === 'case' && CUR) ? CUR.presets : [];
-  if (!list.length) {
-    var o = document.createElement('option');
-    o.value = ''; o.textContent = '– keine Vorlagen –';
-    sel.appendChild(o);
-  }
-  list.forEach(function (p) {
-    var o = document.createElement('option');
-    o.value = p.name; o.textContent = p.name;
-    sel.appendChild(o);
-  });
-  fillPresetsState();
-}
-
-function fillPresetsState() {
-  var has = !!(MODE === 'case' && CUR && CUR.presets.length);
-  $('preset').disabled = !has;
-  $('loadPresetBtn').disabled = !has;
-}
-
-function setPresetFilters(f) {
-  PRESET_FILTERS = f || [];
-  $('presetInfo').style.display = PRESET_FILTERS.length ? '' : 'none';
-  $('usePresetFilters').checked = true;
-}
-
-// Vorlage laden: füllt Kennzahlen, Spalten, Zeitraum und (unsichtbar) die Vorlagenfilter.
-// Danach kann die Nutzerin alles anpassen; die Vorlage selbst bleibt unverändert.
-function loadPreset() {
-  if (!CUR) return;
-  var name = $('preset').value;
-  var p = (CUR.presets || []).filter(function (x) { return x.name === name; })[0];
-  if (!p) { setStatus('Keine Vorlage gewählt.', true); return; }
-
-  resetForm();
-
-  var wanted = (p.measures || []).concat(p.dimensions || []);
-  var want = {}, found = {};
-  wanted.forEach(function (n) { want[n] = true; });
-  Array.prototype.forEach.call(document.querySelectorAll('.list input'), function (i) {
-    if (want[i.value]) { i.checked = true; found[i.value] = true; }
-  });
-  var missing = wanted.filter(function (n) { return !found[n]; });
-
-  if (p.time_dimension) $('timedim').value = p.time_dimension;
-  // Zeitraum tagesgenau und unverändert übernehmen
-  if (p.date_range && p.date_range.length === 2) {
-    $('d1').value = String(p.date_range[0]).slice(0, 10);
-    $('d2').value = String(p.date_range[1]).slice(0, 10);
-  }
-  $('limit').value = PRESET_LIMIT;
-  // Name vorbelegen, damit sich das Ergebnis später per Klick aktualisieren lässt
-  $('saveName').value = p.name + ' (' + CUR.viewLabel + ')';
-  setPresetFilters(p.filters || []);
-
-  updateCounts();
-  applyFilter();
-
-  if (missing.length) {
-    setStatus('Vorlage „' + p.name + '“ geladen, aber diese Felder gibt es in der View nicht: ' + missing.join(', '), true);
-  } else {
-    setStatus('Vorlage „' + p.name + '“ geladen. Mit „In Tabelle schreiben“ ausführen; der Name unter „Abfrage merken“ ist vorbelegt, damit du das Ergebnis später aktualisieren kannst.');
-  }
-}
-
-// =====================================================================
-// Felder, Filter, Zeitraum
-// =====================================================================
-
-// Felder einer View nach Ordnern (folders) gruppieren, Reihenfolge wie geliefert.
-// Felder ohne Ordner kommen unter „Weitere“ ans Ende.
-function folderGroups(view, kind) {
-  var byName = {}, used = {}, out = [];
-  view[kind].forEach(function (it) { byName[it.name] = it; });
-  (view.folders || []).forEach(function (f) {
-    var items = [];
-    (f.members || []).forEach(function (n) {
-      if (byName[n] && !used[n]) { items.push(byName[n]); used[n] = true; }
-    });
-    if (items.length) out.push({ label: f.name, items: items });
-  });
-  var rest = view[kind].filter(function (it) { return !used[it.name]; });
-  if (rest.length) out.push({ label: 'Weitere', items: rest });
-  return out;
-}
-
-// Baut Measures, Dimensions und Zeitdimensionen für den aktuellen Modus neu auf
-function renderLists() {
-  var measures = $('measures'), dims = $('dimensions'), td = $('timedim');
-  measures.textContent = ''; dims.textContent = '';
-  while (td.options.length > 1) td.remove(1);
-
-  var members = {};
-  META.forEach(function (c) {
-    if (c.group) (members[c.group] = members[c.group] || []).push(c.title);
-  });
-
-  var cubes = MODE === 'case' ? (CUR ? [CUR] : []) : META;
-  cubes.forEach(function (c) {
-    if (MODE === 'case') {
-      folderGroups(c, 'measures').forEach(function (g) { addGroup(measures, g.label, c.group, g.items, g.label); });
-      folderGroups(c, 'dimensions').forEach(function (g) { addGroup(dims, g.label, c.group, g.items, g.label); });
-    } else {
-      var hint;
-      if (c.type === 'view') hint = 'View: nur Felder dieser View kombinieren';
-      else if (!c.group) hint = 'Keine Join-Information verfügbar';
-      else {
-        var others = members[c.group].filter(function (t) { return t !== c.title; });
-        hint = others.length ? 'Kombinierbar mit: ' + others.join(', ') : 'Keine Joins zu anderen Cubes';
-      }
-      addGroup(measures, c.title, c.group, c.measures, hint);
-      addGroup(dims, c.title, c.group, c.dimensions, hint);
-    }
-    c.dimensions.forEach(function (d) {
-      if (d.type === 'time') {
-        var o = document.createElement('option');
-        o.value = d.name;
-        o.setAttribute('data-group', c.group);
-        o.textContent = MODE === 'case' ? d.title : c.title + ' › ' + d.title;
-        td.appendChild(o);
-      }
-    });
-  });
-  updateCounts();
-}
-
-function addGroup(box, label, group, items, hint) {
-  if (!items.length) return;
-  var g = document.createElement('div');
-  g.className = 'grp';
-  g.textContent = label;
-  g.title = hint || '';
-  g.setAttribute('data-grp', '1');
-  g.setAttribute('data-group', group);
-  box.appendChild(g);
-  items.forEach(function (it) {
-    var l = document.createElement('label');
-    l.title = it.name;
-    l.setAttribute('data-name', it.name);
-    l.setAttribute('data-group', group);
-    l.setAttribute('data-text', (label + ' ' + it.title + ' ' + it.name + ' ' + (it.explanation || '')).toLowerCase());
-    var cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.value = it.name;
-    l.appendChild(cb);
-    l.appendChild(document.createTextNode(' ' + it.title));
-    if (it.explanation) {
-      var ex = document.createElement('div');
-      ex.className = 'small expl';
-      ex.textContent = it.explanation;
-      l.appendChild(ex);
-    }
-    box.appendChild(l);
-  });
-}
-
-function applyFilter() {
-  var q = $('search').value.trim().toLowerCase();
-  ['measures', 'dimensions'].forEach(function (id) {
-    var box = $(id), anyVisible = false, kids = box.children;
-    for (var i = kids.length - 1; i >= 0; i--) {
-      var el = kids[i];
-      if (el.getAttribute('data-grp')) {
-        el.style.display = anyVisible || !q ? '' : 'none';
-        anyVisible = false;
-      } else {
-        var show = !q || el.getAttribute('data-text').indexOf(q) !== -1 || el.querySelector('input').checked;
-        el.style.display = show ? '' : 'none';
-        if (show) anyVisible = true;
-      }
-    }
-  });
-}
-
-function checked(id) {
-  return Array.prototype.map.call($(id).querySelectorAll('input:checked'), function (i) { return i.value; });
-}
-
-function updateCounts() {
-  $('cm').textContent = '(' + checked('measures').length + ' gewählt)';
-  $('cd').textContent = '(' + checked('dimensions').length + ' gewählt)';
-  refreshCompat();
-  refreshFilters();
-}
-
-// Gruppe der bisherigen Auswahl (Felder oder Zeitdimension); leer = noch nichts gewählt
-function selectedGroup() {
-  var boxes = document.querySelectorAll('.list input:checked');
-  for (var i = 0; i < boxes.length; i++) {
-    var g = boxes[i].parentNode.getAttribute('data-group');
-    if (g) return g;
-  }
-  var opt = $('timedim').options[$('timedim').selectedIndex];
-  return opt ? opt.getAttribute('data-group') || '' : '';
-}
-
-// Felder anderer Gruppen (kein Join-Pfad) ausgrauen und sperren.
-// Im Case-Modus gehören alle Felder zur selben View, hier wird also nichts gesperrt.
-function refreshCompat() {
-  var g = selectedGroup();
-  Array.prototype.forEach.call(document.querySelectorAll('.list label, .list .grp'), function (el) {
-    var eg = el.getAttribute('data-group');
-    var ok = !g || !eg || eg === g;
-    el.style.opacity = ok ? '' : '0.4';
-    var input = el.querySelector('input');
-    if (input) {
-      input.disabled = !ok;
-      el.title = ok ? el.getAttribute('data-name') : 'Nicht kombinierbar mit den gewählten Feldern';
-    }
-  });
-  var td = $('timedim');
-  Array.prototype.forEach.call(td.options, function (o) {
-    var og = o.getAttribute('data-group');
-    o.disabled = !!(g && og && og !== g);
-  });
-  if (td.options[td.selectedIndex].disabled) td.value = '';
-}
-
-// Standard-Zeitdimension: im Case-Modus view.report_date (sonst die erste Zeitdimension)
-function defaultTimeDim() {
-  if (MODE !== 'case' || !CUR) return '';
-  var opts = $('timedim').options, first = '';
-  for (var i = 0; i < opts.length; i++) {
-    var v = opts[i].value;
-    if (!v) continue;
-    if (/\.report_date$/.test(v)) return v;
-    if (!first) first = v;
-  }
-  return first;
-}
-
-// ---------- Filter ----------
-function addFilter() {
-  var row = document.createElement('div');
-  row.className = 'frow';
-
-  var dim = document.createElement('select'); dim.className = 'f-dim';
-  var op = document.createElement('select'); op.className = 'f-op';
-  var val = document.createElement('input');
-  val.type = 'text'; val.className = 'f-val'; val.placeholder = 'Wert(e), mit ; trennen';
-  var rm = document.createElement('button');
-  rm.className = 'sec'; rm.textContent = 'Filter entfernen';
-  rm.onclick = function () { row.parentNode.removeChild(row); };
-
-  dim.onchange = function () { fillOps(row); };
-  op.onchange = function () { toggleVal(row); };
-
-  row.appendChild(dim); row.appendChild(op); row.appendChild(val); row.appendChild(rm);
-  $('filters').appendChild(row);
-  fillDims(row);
-}
-
-// Dimension-Auswahl aus den angehakten Dimensions (ohne Zeitdimensionen) füllen
-function fillDims(row) {
-  var dim = row.querySelector('.f-dim');
-  var old = dim.value;
-  var names = checked('dimensions').filter(function (n) {
-    return DIMS[n] && DIMS[n].type !== 'time';
-  });
-  dim.textContent = '';
-  if (!names.length) {
-    var o = document.createElement('option');
-    o.value = ''; o.textContent = '– erst Dimension auswählen –';
-    dim.appendChild(o);
-  }
-  names.forEach(function (n) {
-    var o = document.createElement('option');
-    o.value = n; o.textContent = dimTitle(n);
-    dim.appendChild(o);
-  });
-  if (names.indexOf(old) !== -1) dim.value = old;
-  fillOps(row);
-}
-
-function fillOps(row) {
-  var dim = row.querySelector('.f-dim').value;
-  var op = row.querySelector('.f-op');
-  var old = op.value;
-  var list = OPS[(DIMS[dim] || {}).type] || OPS.string;
-  op.textContent = '';
-  list.forEach(function (p) {
-    var o = document.createElement('option');
-    o.value = p[0]; o.textContent = p[1];
-    op.appendChild(o);
-  });
-  if (list.some(function (p) { return p[0] === old; })) op.value = old;
-  toggleVal(row);
-}
-
-function toggleVal(row) {
-  var op = row.querySelector('.f-op').value;
-  var val = row.querySelector('.f-val');
-  var noValue = op === 'set' || op === 'notSet';
-  val.disabled = noValue;
-  if (noValue) val.value = '';
-}
-
-function refreshFilters() {
-  Array.prototype.forEach.call($('filters').children, function (row) { fillDims(row); });
-}
-
-function collectFilters() {
-  var out = [];
-  var rows = $('filters').children;
-  for (var i = 0; i < rows.length; i++) {
-    var member = rows[i].querySelector('.f-dim').value;
-    var op = rows[i].querySelector('.f-op').value;
-    var raw = rows[i].querySelector('.f-val').value;
-    if (!member) return { error: 'Jeder Filter braucht eine ausgewählte Dimension.' };
-    if (op === 'set' || op === 'notSet') {
-      out.push({ member: member, operator: op });
-    } else {
-      var values = raw.split(';').map(function (s) { return s.trim(); }).filter(Boolean);
-      if (!values.length) return { error: 'Bitte einen Wert für den Filter „' + dimTitle(member) + '“ eingeben.' };
-      out.push({ member: member, operator: op, values: values });
-    }
-  }
-  return { filters: out };
-}
-
-// ---------- Zurücksetzen, Abfrage bauen, ausführen ----------
-// Setzt Auswahl, Filter, Zeitraum, Limit, Name und Vorlagenfilter zurück
-// (Modus, gewählte View und Vorlagenliste bleiben erhalten).
-function resetForm() {
-  Array.prototype.forEach.call(document.querySelectorAll('.list input'), function (i) { i.checked = false; });
-  $('d1').value = ''; $('d2').value = ''; $('gran').value = '';
-  $('search').value = '';
-  $('saveName').value = '';
-  $('filters').textContent = '';
-  $('limit').value = 1000;
-  setPresetFilters([]);
-  $('timedim').value = defaultTimeDim();
-  applyFilter(); updateCounts(); setStatus('');
-}
-
-function clearAll() { resetForm(); }
-
-// d3-Formate (meta.format) der gewählten Measures; das Backend macht daraus die Excel-Zahlenformate
-function formatsFor(measures) {
-  var out = {};
-  measures.forEach(function (m) { if (FMT[m]) out[m] = FMT[m]; });
-  return out;
-}
-
-function buildQuery() {
-  var measures = checked('measures'), dimensions = checked('dimensions');
-  if (!measures.length && !dimensions.length) {
-    return { error: 'Wähle mindestens ein Measure oder eine Dimension.' };
-  }
-
-  var limit = parseInt($('limit').value, 10) || 1000;
-  if (limit > MAX_LIMIT) return { error: 'Max. Zeilen: höchstens 50.000 (Limit der Instanz).' };
-  var query = { measures: measures, dimensions: dimensions, limit: limit };
-
-  // Zeitraum: tagesgenau, ohne Rundung. Im Case-Modus ohne Granularität
-  // (Jahr, Monat und Tag kommen als Dimensions aus der Kalender-Gruppe).
-  var dim = $('timedim').value, d1 = $('d1').value, d2 = $('d2').value;
-  var gran = MODE === 'dev' ? $('gran').value : '';
-  if ((d1 || d2 || gran) && !dim) {
-    return { error: 'Wähle eine Zeitdimension für Zeitraum oder Gruppierung.' };
-  }
-  if ((d1 && !d2) || (!d1 && d2)) {
-    return { error: 'Bitte Anfang („von“) und Ende („bis“) des Zeitraums angeben.' };
-  }
-  if (d1 && d2 && d2 < d1) return { error: '„bis“ darf nicht vor „von“ liegen.' };
-  if (dim && (d1 || gran)) {
-    var td = { dimension: dim };
-    if (d1) td.dateRange = [d1, d2];
-    if (gran) td.granularity = gran;
-    query.timeDimensions = [td];
-  }
-
-  // Filter: Vorlagenfilter unverändert, dazu die Filter der Nutzerin (alle gelten zusammen: „und“)
-  var f = collectFilters();
-  if (f.error) return { error: f.error };
-  var all = ($('usePresetFilters').checked ? PRESET_FILTERS : []).concat(f.filters);
-  if (all.length) query.filters = all;
-
-  return { query: query };
-}
-
-// Schreibt das Ergebnis ab der aktiven Zelle.
-// Mit Namen wird die Abfrage samt Zielposition gespeichert (gleicher Name = überschreiben).
-async function run() {
-  var b = buildQuery();
-  if (b.error) { setStatus(b.error, true); return; }
-  var name = $('saveName').value.trim();
-  var formats = formatsFor(b.query.measures);
-
-  var ok = await withBusy('Abfrage läuft …', async function () {
-    var table = await fetchTable(b.query, formats);
-    if (!table) return 'Keine Daten' + (name ? ' (nicht gespeichert)' : '');
-    var target = await writeTable(table.values, null, table.formats);
-    var msg = (table.values.length - 1) + ' Zeilen geschrieben';
-    if (name) {
-      await saveQuery(name, b.query, target, formats);
-      msg += ' · als „' + name + '“ gespeichert';
-    }
-    if (table.warn) msg += '\n' + table.warn;
-    return msg;
-  });
-  if (ok && name) await loadSaved();
-}
-
-// ---------- Werkzeuge: Cube-Übersicht in die Tabelle ----------
-function groupLabel(c) {
-  if (c.group && c.group.indexOf('cc:') === 0) return 'Gruppe ' + c.group.slice(3);
-  if (c.type === 'view') return 'View ' + c.name;
-  return 'Unbekannt';
-}
-
-async function writeMeta() {
-  await withBusy('Schreibe Cube-Übersicht …', async function () {
-    if (!META.length) META = (await runScript('getMeta')) || [];
-    var rows = [['Cube', 'Art', 'Kombinierbar (Gruppe)', 'Feldart', 'Name', 'Datentyp']];
-    META.forEach(function (c) {
-      var head = [c.name, c.type, groupLabel(c)];
-      c.measures.forEach(function (m) { rows.push(head.concat(['Measure', m.name, ''])); });
-      c.dimensions.forEach(function (d) { rows.push(head.concat(['Dimension', d.name, d.type])); });
-    });
-    await writeTable(rows);
-    return (rows.length - 1) + ' Einträge geschrieben';
-  });
-}
-
-// Zeigt, welche Cubes sich miteinander kombinieren lassen (gleiche Gruppe = Join-Pfad vorhanden)
-async function writeJoinGroups() {
-  await withBusy('Schreibe Gruppen …', async function () {
-    if (!META.length) META = (await runScript('getMeta')) || [];
-    var groups = {};
-    META.forEach(function (c) {
-      var label = groupLabel(c);
-      (groups[label] = groups[label] || []).push(c.name);
-    });
-    var rows = [['Gruppe', 'Cubes (untereinander kombinierbar)', 'Anzahl']];
-    Object.keys(groups).sort().forEach(function (label) {
-      rows.push([label, groups[label].sort().join(', '), groups[label].length]);
-    });
-    await writeTable(rows);
-    return (rows.length - 1) + ' Gruppen geschrieben';
-  });
-}
-
-// =====================================================================
-// Start
-// =====================================================================
-
-Office.onReady(function () {
-  var id = (window.CONFIG && CONFIG.DEPLOYMENT_ID) || '';
-  $('build').textContent = 'Build ' + BUILD + ' · Deployment-ID: ' + (id ? id.slice(0, 10) + '…' : 'FEHLT');
-
-  $('measures').addEventListener('change', updateCounts);
-  $('dimensions').addEventListener('change', updateCounts);
-
-  $('login').disabled = false;
-  renderAuth();
-
-  $('login').onclick = async function () {
-    setStatus('');
-    try {
-      await login();
-      renderAuth();
-      startApp();
-    } catch (e) {
-      setStatus('Fehler: ' + e.message, true);
-    }
-  };
-
-  $('logout').onclick = function () {
-    clearSession();
-    started = false;
-    setStatus('Abgemeldet.');
-    renderAuth();
-  };
-
-  if (getSession()) startApp();
-});
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cube</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; margin: 12px; color: #202124; background: #fff; }
+  h3 { font-size: 13px; margin: 14px 0 4px; }
+  select, input[type=number], input[type=search], input[type=text], input[type=date] { width: 100%; box-sizing: border-box; padding: 6px; }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  .small { font-size: 12px; color: #5f6368; margin: 2px 0; }
+  .list { max-height: 170px; overflow: auto; border: 1px solid #dadce0; padding: 4px 6px; border-radius: 4px; }
+  .grp { font-weight: bold; margin: 8px 0 2px; color: #3c4043; }
+  .list label { display: block; margin: 2px 0; cursor: pointer; }
+  .list .expl { margin: 0 0 2px 20px; cursor: default; }
+  button { margin-top: 12px; width: 100%; padding: 10px; background: #217346; color: #fff;
+           border: 0; border-radius: 4px; font-size: 14px; font-family: inherit; cursor: pointer; }
+  button.sec { background: #fff; color: #217346; border: 1px solid #dadce0; padding: 6px; font-size: 12px; }
+  button:disabled { background: #9aa0a6; color: #fff; cursor: default; }
+  button.sec:disabled { background: #f1f3f4; color: #9aa0a6; }
+  #status { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #dadce0;
+            margin-top: 10px; padding: 8px 0; min-height: 18px; white-space: pre-wrap; }
+  .err { color: #d93025; }
+  .warn { color: #b06000; }
+  [hidden] { display: none !important; }
+
+  .userbar { display: flex; align-items: center; gap: 8px; }
+  .userbar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .userbar button { width: auto; margin-top: 0; padding: 4px 8px; }
+
+  /* Filter */
+  .frow { border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; }
+  .frow select, .frow input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; margin-bottom: 4px; }
+  .frow button { margin-top: 2px; }
+  #addFilter { margin-top: 6px; }
+  #presetInfo { border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; background: #f8f9fa; }
+
+  /* Pivot-Editor */
+  #pivotBox { margin-top: 8px; }
+  #pivotBox label { display: block; margin: 4px 0; }
+  .zone { border: 1px dashed #9aa0a6; border-radius: 4px; padding: 4px 6px; margin: 6px 0; min-height: 34px; background: #fafafa; }
+  .zone.over { border-color: #217346; background: #e6f4ea; }
+  .zone .zhead { font-weight: bold; font-size: 12px; color: #3c4043; margin-bottom: 2px; }
+  .zempty { font-size: 12px; color: #80868b; }
+  .chip { display: flex; align-items: center; gap: 4px; background: #fff; border: 1px solid #dadce0; border-radius: 4px; padding: 3px 6px; margin: 3px 0; cursor: grab; }
+  .chip .ctitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip select { width: auto; padding: 2px; font-size: 12px; }
+  .chip button { width: auto; margin-top: 0; padding: 0 4px; background: none; color: #5f6368; border: 0; font-size: 12px; }
+  .chip button:disabled { background: none; color: #bdc1c6; }
+
+  /* Gespeicherte Abfragen */
+  .srow { display: flex; align-items: center; gap: 6px; border: 1px solid #dadce0; border-radius: 4px; padding: 6px; margin: 6px 0; }
+  .srow .sinfo { flex: 1; min-width: 0; }
+  .srow .sname { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srow button { width: auto; margin-top: 0; padding: 4px 8px; }
+  #refreshAll { margin-top: 6px; }
+</style>
+</head>
+<body>
+
+  <!-- Nicht angemeldet -->
+  <div id="loggedOut">
+    <h3 style="margin-top:0">Cube</h3>
+    <p>Bitte zuerst mit Google anmelden.</p>
+    <button id="login" disabled>Mit Google anmelden</button>
+  </div>
+
+  <!-- Angemeldet: gleiche Oberfläche wie die Sheets-Seitenleiste -->
+  <div id="app" hidden>
+    <div class="userbar"><span id="user" class="small"></span><button id="logout" class="sec">Abmelden</button></div>
+
+    <h3>Gespeicherte Abfragen</h3>
+    <div id="saved"></div>
+    <div id="savedEmpty" class="small">Noch keine gespeicherten Abfragen. Gib unten bei „Abfrage merken“ einen Namen an und schreibe die Daten in die Tabelle.</div>
+    <button id="refreshAll" class="sec" style="display:none" onclick="refreshAll()">Alle aktualisieren</button>
+
+    <h3>Neue Abfrage</h3>
+    <select id="mode" onchange="onModeChange()">
+      <option value="case">Auswertungen (Cases)</option>
+      <option value="dev">Alle Cubes und Views (Entwickler)</option>
+    </select>
+
+    <!-- Case-Modus: Auswertung (View) und zentrale Vorlagen -->
+    <div id="caseBox">
+      <div class="small" style="margin-top:8px">Auswertung</div>
+      <select id="viewSel" onchange="onViewChange()"></select>
+
+      <div class="small" style="margin-top:8px">Vorlage</div>
+      <div class="row">
+        <div style="flex:3"><select id="preset"></select></div>
+        <div style="flex:1"><button id="loadPresetBtn" class="sec" style="margin-top:0;width:100%" onclick="loadPreset()">Laden</button></div>
+      </div>
+      <div class="small">Vorlagen kommen zentral aus dem Datenmodell und sind für alle gleich. Nach dem Laden kannst du Kennzahlen, Spalten und Zeitraum anpassen; die Vorlage selbst bleibt unverändert.</div>
+
+      <div id="presetInfo" style="display:none">
+        <label><input type="checkbox" id="usePresetFilters" checked> Vorlagenfilter anwenden</label>
+        <div class="small">Die Vorlage blendet Zeilen ohne Wert aus (Kennzahlfilter). Sie werden unverändert an Cube geschickt, auch wenn sie unten nicht erscheinen.</div>
+      </div>
+    </div>
+
+    <div class="small" style="margin-top:10px">Ausgabe</div>
+    <select id="output" onchange="onOutputChange()">
+      <option value="flat">Tabelle (flach)</option>
+      <option value="pivot">Pivot-Tabelle (Felder ziehen)</option>
+    </select>
+
+    <!-- Pivot-Editor: Felder aus den Listen unten hierher ziehen -->
+    <div id="pivotBox" style="display:none">
+      <div class="small">Felder aus den Listen unten in die Bereiche ziehen (oder dort anhaken). Das Add-in holt die Daten im Hintergrund, pivotiert sie selbst und schreibt nur das fertige Ergebnis ab der markierten Zelle ins Blatt (keine Rohdaten, keine Excel-PivotTable).</div>
+      <div class="zone" id="zone-rows"><div class="zhead">Zeilen</div><div class="zbody"></div></div>
+      <div class="zone" id="zone-cols"><div class="zhead">Spalten</div><div class="zbody"></div></div>
+      <div class="zone" id="zone-vals"><div class="zhead">Werte</div><div class="zbody"></div></div>
+      <label><input type="checkbox" id="grandTotals" checked> Gesamtergebnis (letzte Zeile und Spalte)</label>
+      <label><input type="checkbox" id="repeatLabels"> Zeilenbeschriftungen in jeder Zeile wiederholen</label>
+      <div class="small">Gesamtergebnisse nutzen die Aggregation des jeweiligen Werts (Summe, Mittelwert …), wie in einer Excel-Pivot.</div>
+    </div>
+
+    <input type="search" id="search" placeholder="Felder suchen …" oninput="applyFilter()" style="margin-top:10px">
+
+    <h3>Measures <span id="cm" class="small"></span></h3>
+    <div id="measures" class="list"></div>
+
+    <h3>Dimensions <span id="cd" class="small"></span></h3>
+    <div id="dimensions" class="list"></div>
+    <div id="devHint" class="small">Ausgegraute Felder lassen sich nicht mit deiner Auswahl kombinieren (kein Join-Pfad im Cube-Modell). Mit der Maus über einen Cube-Namen fahren zeigt die kombinierbaren Cubes.</div>
+
+    <h3>Filter</h3>
+    <div id="filters"></div>
+    <button id="addFilter" class="sec" onclick="addFilter()">+ Filter hinzufügen</button>
+    <div class="small">Filter beziehen sich auf die gewählten Dimensions. Mehrere Werte mit Semikolon trennen (= „oder“). Mehrere Filter gelten zusammen („und“). Zeitdimensionen filterst du über „Zeitraum“.</div>
+
+    <h3>Zeitraum</h3>
+    <select id="timedim" onchange="refreshCompat()"><option value="">– kein Zeitfilter –</option></select>
+    <div class="row" style="margin-top:6px">
+      <div><div class="small">von</div><input type="date" id="d1"></div>
+      <div><div class="small">bis (einschließlich)</div><input type="date" id="d2"></div>
+    </div>
+    <div id="granBox">
+      <div class="small" style="margin-top:6px">Gruppieren nach</div>
+      <select id="gran">
+        <option value="">Keine Zeitspalte</option>
+        <option value="year">Jahr</option>
+        <option value="quarter">Quartal</option>
+        <option value="month">Monat</option>
+        <option value="week">Woche</option>
+        <option value="day">Tag</option>
+      </select>
+    </div>
+
+    <h3>Max. Zeilen</h3>
+    <input type="number" id="limit" value="1000" min="1" max="50000">
+    <div class="small">Höchstwert 50.000. Wird das Limit erreicht, erscheint ein Hinweis. Vorlagen setzen das Limit automatisch auf 50.000.</div>
+
+    <h3>Abfrage merken (optional)</h3>
+    <input type="text" id="saveName" placeholder="Name, z. B. Umsatz je Kunde 2024">
+    <div class="small">Mit Name wird die Abfrage samt Zielzelle in dieser Arbeitsmappe gespeichert und lässt sich oben per Klick aktualisieren. Ein bereits vergebener Name wird überschrieben. Beim Laden einer Vorlage ist ein Name vorbelegt.</div>
+
+    <button id="go" onclick="run()">In Tabelle schreiben</button>
+    <button class="sec" onclick="clearAll()">Auswahl löschen</button>
+    <div id="startHint" class="small">Das Ergebnis beginnt in der aktuell markierten Zelle.</div>
+
+    <h3>Werkzeuge</h3>
+    <button class="sec" style="margin-top:4px" onclick="writeJoinGroups()">Kombinierbare Cubes in Tabelle schreiben</button>
+    <button class="sec" style="margin-top:6px" onclick="writeMeta()">Cube-Übersicht in Tabelle schreiben</button>
+  </div>
+
+  <div id="status" role="status"></div>
+  <div id="build" class="small"></div>
+
+  <script src="config.js?v=cube4"></script>
+  <script src="taskpane.js?v=cube4"></script>
+</body>
+</html>
